@@ -10,7 +10,6 @@ import random
 import urllib.parse
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import List, Dict, Optional, Tuple, Any, Set
 from datetime import datetime
 from collections import Counter
@@ -22,7 +21,6 @@ except Exception:
     KYIV_TZ = None
 
 import requests
-from requests.adapters import HTTPAdapter
 import telebot
 from telebot import types, apihelper
 from flask import Flask, jsonify, render_template_string
@@ -53,10 +51,7 @@ SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
 
 MAX_LOG_LINES = 15
-TARGET_CONN_TIMEOUT = 2.5
-TARGET_READ_TIMEOUT = 3.5
-HARD_THREAD_TIMEOUT = 6.5
-DOSSIER_THREAD_TIMEOUT = 3.5
+TARGET_TIMEOUT = (2.0, 3.0)
 
 if not CONTROL_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения CONTROL_BOT_TOKEN!")
@@ -64,14 +59,9 @@ if not CONTROL_BOT_TOKEN:
 bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=6)
 app = Flask(__name__)
 
-http_watch_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="HttpWatch")
-
 search_session = requests.Session()
-_s_adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=0)
-search_session.mount("https://", _s_adapter)
-search_session.mount("http://", _s_adapter)
 search_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/8.3 (+https://github.com)",
+    "User-Agent": "HunterPRO-Scanner/8.4 (+https://github.com)",
     "Accept": "application/json",
 })
 
@@ -96,6 +86,10 @@ def format_time(seconds: Optional[float]) -> str:
     minutes, sec = divmod(total, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+
+
+def dbg(msg: str) -> None:
+    print(f"[{kyiv_time_str('%H:%M:%S')}] [DBG] {msg}", flush=True)
 
 
 # =====================================================================
@@ -532,16 +526,15 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# 7. ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (СТОРОЖЕВОЙ ТАЙМАУТ + ПАРАЛЛЕЛЬНОЕ ДОСЬЕ)
+# 7. ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (ПРЯМОЙ ВЫЗОВ + ПОШАГОВЫЙ ЛОГ)
 # =====================================================================
-def _raw_requests_get(
+def _direct_get_json(
     full_url: str,
-    headers: Optional[Dict[str, str]],
-    connect_timeout: float,
-    read_timeout: float,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: Tuple[float, float] = TARGET_TIMEOUT,
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     req_headers = {
-        "User-Agent": "HunterPRO-Verifier/8.3",
+        "User-Agent": "HunterPRO-Verifier/8.4",
         "Accept": "application/json",
         "Connection": "close",
     }
@@ -552,7 +545,7 @@ def _raw_requests_get(
         resp = requests.get(
             full_url,
             headers=req_headers,
-            timeout=(connect_timeout, read_timeout),
+            timeout=timeout,
             allow_redirects=False,
         )
         status = resp.status_code
@@ -582,42 +575,15 @@ def _raw_requests_get(
         return 0, None, f"err:{str(exc)[:20]}"
 
 
-def _http_get_json_guarded(
-    full_url: str,
-    headers: Optional[Dict[str, str]] = None,
-    connect_timeout: float = TARGET_CONN_TIMEOUT,
-    read_timeout: float = TARGET_READ_TIMEOUT,
-    hard_timeout: float = HARD_THREAD_TIMEOUT,
-) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
-    parsed = urllib.parse.urlparse(full_url)
-    if not parsed.scheme or not parsed.hostname:
-        return 0, None, "bad url"
-
-    future = http_watch_executor.submit(
-        _raw_requests_get,
-        full_url,
-        headers,
-        connect_timeout,
-        read_timeout,
-    )
-    try:
-        return future.result(timeout=hard_timeout)
-    except FuturesTimeoutError:
-        future.cancel()
-        return 0, None, "жёсткий таймаут SSL/сети"
-    except Exception as exc:
-        return 0, None, f"watch_err:{str(exc)[:20]}"
-
-
 def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    dbg("1/4: запрос getMe...")
     t0 = time.time()
-    code, payload, err = _http_get_json_guarded(
+    code, payload, err = _direct_get_json(
         f"https://api.telegram.org/bot{token}/getMe",
-        connect_timeout=TARGET_CONN_TIMEOUT,
-        read_timeout=TARGET_READ_TIMEOUT,
-        hard_timeout=HARD_THREAD_TIMEOUT,
+        timeout=TARGET_TIMEOUT,
     )
     dt = time.time() - t0
+    dbg(f"1/4 ответ getMe: code={code}, err={err}, dt={dt:.2f}с")
 
     if code == 429:
         return False, None, False, "", f"rate limit 429 ({dt:.1f}с)"
@@ -638,70 +604,50 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
         for word in SCAM_KEYWORDS
     )
 
-    # Параллельный сбор досье (3 запроса одновременно вместо последовательных)
-    f_desc = http_watch_executor.submit(
-        _raw_requests_get,
-        f"https://api.telegram.org/bot{token}/getMyDescription",
-        None,
-        1.5,
-        2.5,
-    )
-    f_cmds = http_watch_executor.submit(
-        _raw_requests_get,
-        f"https://api.telegram.org/bot{token}/getMyCommands",
-        None,
-        1.5,
-        2.5,
-    )
-    f_wh = http_watch_executor.submit(
-        _raw_requests_get,
-        f"https://api.telegram.org/bot{token}/getWebhookInfo",
-        None,
-        1.5,
-        2.5,
-    )
-
     desc_text = "Нет описания"
     cmds_text = "Нет команд"
     wh_text = "Webhook не задан"
 
-    try:
-        _, d_data, _ = f_desc.result(timeout=DOSSIER_THREAD_TIMEOUT)
-        if isinstance(d_data, dict) and isinstance(d_data.get("result"), dict):
-            raw_desc = d_data["result"].get("description")
-            if raw_desc:
-                desc_text = html.escape(str(raw_desc).strip()[:200])
-    except Exception:
-        pass
+    dbg("2/4: запрос getMyDescription...")
+    _, d_data, _ = _direct_get_json(
+        f"https://api.telegram.org/bot{token}/getMyDescription",
+        timeout=(1.5, 2.0),
+    )
+    if isinstance(d_data, dict) and isinstance(d_data.get("result"), dict):
+        raw_desc = d_data["result"].get("description")
+        if raw_desc:
+            desc_text = html.escape(str(raw_desc).strip()[:200])
 
-    try:
-        _, c_data, _ = f_cmds.result(timeout=DOSSIER_THREAD_TIMEOUT)
-        if isinstance(c_data, dict) and isinstance(c_data.get("result"), list):
-            parsed = [
-                html.escape(f"/{c.get('command', '')}")
-                for c in c_data["result"][:10]
-                if isinstance(c, dict) and c.get("command")
-            ]
-            if parsed:
-                cmds_text = ", ".join(parsed)
-    except Exception:
-        pass
+    dbg("3/4: запрос getMyCommands...")
+    _, c_data, _ = _direct_get_json(
+        f"https://api.telegram.org/bot{token}/getMyCommands",
+        timeout=(1.5, 2.0),
+    )
+    if isinstance(c_data, dict) and isinstance(c_data.get("result"), list):
+        parsed = [
+            html.escape(f"/{c.get('command', '')}")
+            for c in c_data["result"][:10]
+            if isinstance(c, dict) and c.get("command")
+        ]
+        if parsed:
+            cmds_text = ", ".join(parsed)
 
-    try:
-        _, wh_data, _ = f_wh.result(timeout=DOSSIER_THREAD_TIMEOUT)
-        if isinstance(wh_data, dict) and isinstance(wh_data.get("result"), dict):
-            wh_res = wh_data["result"]
-            wh_url = str(wh_res.get("url") or "").strip()
-            pending = int(wh_res.get("pending_update_count") or 0)
-            last_err = str(wh_res.get("last_error_message") or "").strip()
-            if wh_url:
-                wh_text = f"<code>{html.escape(wh_url[:90])}</code> (очередь: {pending})"
-                if last_err:
-                    wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:90])}</code>"
-            else:
-                wh_text = f"Не задан (очередь: {pending})"
-    except Exception:
-        pass
+    dbg("4/4: запрос getWebhookInfo...")
+    _, wh_data, _ = _direct_get_json(
+        f"https://api.telegram.org/bot{token}/getWebhookInfo",
+        timeout=(1.5, 2.0),
+    )
+    if isinstance(wh_data, dict) and isinstance(wh_data.get("result"), dict):
+        wh_res = wh_data["result"]
+        wh_url = str(wh_res.get("url") or "").strip()
+        pending = int(wh_res.get("pending_update_count") or 0)
+        last_err = str(wh_res.get("last_error_message") or "").strip()
+        if wh_url:
+            wh_text = f"<code>{html.escape(wh_url[:90])}</code> (очередь: {pending})"
+            if last_err:
+                wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:90])}</code>"
+        else:
+            wh_text = f"Не задан (очередь: {pending})"
 
     dossier = (
         f"📝 <b>Био:</b> {desc_text}\n"
@@ -712,15 +658,15 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
 
 
 def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    dbg("Discord bot check...")
     t0 = time.time()
-    code, data, err = _http_get_json_guarded(
+    code, data, err = _direct_get_json(
         "https://discord.com/api/v10/users/@me",
         headers={"Authorization": f"Bot {token}"},
-        connect_timeout=TARGET_CONN_TIMEOUT,
-        read_timeout=TARGET_READ_TIMEOUT,
-        hard_timeout=HARD_THREAD_TIMEOUT,
+        timeout=TARGET_TIMEOUT,
     )
     dt = time.time() - t0
+    dbg(f"Discord bot ответ: code={code}, err={err}, dt={dt:.2f}с")
     if code == 200 and isinstance(data, dict):
         username = data.get("username") or "DiscordBot"
         discriminator = data.get("discriminator")
@@ -735,14 +681,14 @@ def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Opt
 
 
 def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    dbg("Discord webhook check...")
     t0 = time.time()
-    code, data, err = _http_get_json_guarded(
+    code, data, err = _direct_get_json(
         webhook_url,
-        connect_timeout=TARGET_CONN_TIMEOUT,
-        read_timeout=TARGET_READ_TIMEOUT,
-        hard_timeout=HARD_THREAD_TIMEOUT,
+        timeout=TARGET_TIMEOUT,
     )
     dt = time.time() - t0
+    dbg(f"Discord webhook ответ: code={code}, err={err}, dt={dt:.2f}с")
     if code == 200 and isinstance(data, dict):
         name = data.get("name") or "Webhook"
         ch_id = data.get("channel_id")
@@ -1485,7 +1431,7 @@ def send_welcome(message: types.Message):
     cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
-        "👋 <b>Пульт Hunter PRO v8.3</b>\n"
+        "👋 <b>Пульт Hunter PRO v8.4</b>\n"
         "Сканер токенов и вебхуков с ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
         f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
@@ -2259,6 +2205,8 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         traceback.print_exc()
         err_reason = f"сбой:{str(exc)[:18]}"
 
+    dbg(f"результат проверки: is_live={is_live}, bot={bot_name}, err={err_reason}")
+
     with state_lock:
         search_state["checked_tokens"] += 1
         checked_now = search_state["checked_tokens"]
@@ -2429,7 +2377,6 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
 # 13. ЗАПУСК ПОЛЛИНГА БОТА (УСТОЙЧИВОСТЬ К 409 CONFLICT) И FLASK
 # =====================================================================
 def run_bot_polling() -> None:
-    # Небольшая пауза при деплое, чтобы старый контейнер Render успел завершиться
     time.sleep(3)
     try:
         bot.remove_webhook()
