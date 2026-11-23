@@ -7,15 +7,18 @@ import time
 import json
 import base64
 import random
-import socket
 import urllib.parse
-import urllib.request
-import urllib.error
 import threading
 import concurrent.futures
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 from collections import Counter
+
+try:
+    from zoneinfo import ZoneInfo
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except Exception:
+    KYIV_TZ = None
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -53,8 +56,6 @@ SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 MAX_LOG_LINES = 15
-CHECK_SOCKET_TIMEOUT = 1.8
-CHECK_HARD_TIMEOUT = 2.8
 
 if not CONTROL_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения CONTROL_BOT_TOKEN!")
@@ -62,14 +63,27 @@ if not CONTROL_BOT_TOKEN:
 bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=6)
 app = Flask(__name__)
 
-# Сессия только для GitHub / GitLab API
+# Сессия без ретраев с короткими таймаутами
 http_session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=0)
+_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
 http_session.mount("https://", _adapter)
 http_session.mount("http://", _adapter)
 http_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/7.5 (+https://github.com)"
+    "User-Agent": "HunterPRO-Scanner/7.6 (+https://github.com)"
 })
+
+
+# =====================================================================
+# ВРЕМЯ ПО КИЕВУ
+# =====================================================================
+def now_kyiv() -> datetime:
+    if KYIV_TZ is not None:
+        return datetime.now(KYIV_TZ)
+    return datetime.now()
+
+
+def kyiv_time_str(fmt: str = "%H:%M:%S") -> str:
+    return now_kyiv().strftime(fmt)
 
 
 # =====================================================================
@@ -228,7 +242,7 @@ def format_time(seconds: Optional[float]) -> str:
 
 
 def add_log(text: str, print_stdout: bool = True) -> None:
-    time_str = datetime.now().strftime("%H:%M:%S")
+    time_str = kyiv_time_str("%H:%M:%S")
     clean_text = str(text).replace("\n", " ").strip()
     log_entry = f"[{time_str}] {clean_text}"
     with state_lock:
@@ -401,7 +415,7 @@ def save_to_google_sheets(data: Dict[str, Any]) -> bool:
         if worksheet is None:
             return False
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = kyiv_time_str("%Y-%m-%d %H:%M:%S")
         row = [
             timestamp,
             str(data.get("type", "")),
@@ -417,7 +431,7 @@ def save_to_google_sheets(data: Dict[str, Any]) -> bool:
             add_log("☁️ Записано в Google Таблицу!")
             return True
         except Exception as exc:
-            add_log(f"⚠️ Переподключаюсь к Google Sheets ({exc})...")
+            add_log(f"⚠️ Переподключаюсь к Google Sheets ({str(exc)[:30]})...")
             worksheet = get_google_worksheet(force_reconnect=True)
             if worksheet is not None:
                 try:
@@ -446,7 +460,7 @@ def load_seen_tokens() -> set:
             with open(SEEN_DB_FILE, "r", encoding="utf-8") as f:
                 return {line.strip() for line in f if line.strip()}
         except Exception as exc:
-            add_log(f"⚠️ Ошибка чтения {SEEN_DB_FILE}: {exc}")
+            add_log(f"⚠️ Ошибка чтения {SEEN_DB_FILE}: {str(exc)[:30]}")
             return set()
 
 
@@ -458,7 +472,7 @@ def append_seen_token(token: str) -> None:
             with open(SEEN_DB_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{token}\n")
         except Exception as exc:
-            add_log(f"⚠️ Ошибка записи в {SEEN_DB_FILE}: {exc}")
+            add_log(f"⚠️ Ошибка записи в {SEEN_DB_FILE}: {str(exc)[:30]}")
 
 
 def clear_seen_tokens() -> None:
@@ -467,7 +481,7 @@ def clear_seen_tokens() -> None:
             with open(SEEN_DB_FILE, "w", encoding="utf-8") as f:
                 f.write("")
         except Exception as exc:
-            add_log(f"⚠️ Ошибка очистки {SEEN_DB_FILE}: {exc}")
+            add_log(f"⚠️ Ошибка очистки {SEEN_DB_FILE}: {str(exc)[:30]}")
 
 
 def load_live_tokens() -> List[Dict[str, Any]]:
@@ -479,7 +493,7 @@ def load_live_tokens() -> List[Dict[str, Any]]:
                 data = json.load(f)
                 return data if isinstance(data, list) else []
         except Exception as exc:
-            add_log(f"⚠️ Ошибка чтения {LIVE_DB_FILE}: {exc}")
+            add_log(f"⚠️ Ошибка чтения {LIVE_DB_FILE}: {str(exc)[:30]}")
             return []
 
 
@@ -498,14 +512,14 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
         if not any(item.get("token") == token_data.get("token") for item in live_list):
             enriched = dict(token_data)
-            enriched.setdefault("found_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            enriched.setdefault("found_at", kyiv_time_str("%Y-%m-%d %H:%M:%S"))
             live_list.append(enriched)
             try:
                 with open(LIVE_DB_FILE, "w", encoding="utf-8") as f:
                     json.dump(live_list, f, ensure_ascii=False, indent=4)
                 added = True
             except Exception as exc:
-                add_log(f"❌ Ошибка сохранения {LIVE_DB_FILE}: {exc}")
+                add_log(f"❌ Ошибка сохранения {LIVE_DB_FILE}: {str(exc)[:30]}")
 
     if added:
         threading.Thread(
@@ -517,52 +531,37 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ ЧЕРЕЗ ЧИСТЫЙ URLLIB + ЖЁСТКИЙ ТАЙМАУТ
+# ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (ПРЯМО, БЫСТРО И БЕЗ ЗАВИСАНИЙ)
 # =====================================================================
-def _http_get_json_fast(
-    url: str, headers: Optional[Dict[str, str]] = None, timeout_sec: float = CHECK_SOCKET_TIMEOUT
+def _fast_get_json(
+    url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 2.5
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
-    req_headers = {
-        "User-Agent": "HunterPRO-FastCheck/7.5",
-        "Accept": "application/json",
-    }
-    if headers:
-        req_headers.update(headers)
-
-    req = urllib.request.Request(url, headers=req_headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            status = getattr(resp, "status", 200)
-            raw = resp.read(65536).decode("utf-8", errors="ignore")
-            try:
-                return status, json.loads(raw), None
-            except Exception:
-                return status, None, "bad json"
-    except urllib.error.HTTPError as http_err:
-        return http_err.code, None, f"HTTP {http_err.code}"
-    except urllib.error.URLError as url_err:
-        reason = getattr(url_err, "reason", url_err)
-        if isinstance(reason, (socket.timeout, TimeoutError)):
-            return 0, None, "таймаут"
-        return 0, None, str(reason)[:28]
-    except (socket.timeout, TimeoutError):
+        resp = http_session.get(url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return resp.status_code, None, f"HTTP {resp.status_code}"
+        try:
+            return 200, resp.json(), None
+        except Exception:
+            return 200, None, "bad json"
+    except requests.Timeout:
         return 0, None, "таймаут"
+    except requests.ConnectionError:
+        return 0, None, "ошибка сети"
     except Exception as exc:
-        return 0, None, str(exc)[:28]
+        return 0, None, str(exc)[:25]
 
 
-def _inspect_telegram_fast(
-    token: str,
-) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    code, payload, err = _http_get_json_fast(
+def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    code, payload, err = _fast_get_json(
         f"https://api.telegram.org/bot{token}/getMe",
-        timeout_sec=CHECK_SOCKET_TIMEOUT,
+        timeout=2.5,
     )
     if code != 200 or not isinstance(payload, dict):
         return False, None, False, "", err or f"HTTP {code}"
 
     if not (payload.get("ok") and isinstance(payload.get("result"), dict)):
-        return False, None, False, "", "ok=false"
+        return False, None, False, "", "невалидный токен"
 
     result = payload["result"]
     username = result.get("username") or result.get("first_name") or "UnknownBot"
@@ -574,33 +573,33 @@ def _inspect_telegram_fast(
 
     desc_text = "Нет описания"
     cmds_text = "Нет команд"
-    wh_text = "Webhook не задан (polling)"
+    wh_text = "Webhook не задан"
 
-    _, d_data, _ = _http_get_json_fast(
+    _, d_data, _ = _fast_get_json(
         f"https://api.telegram.org/bot{token}/getMyDescription",
-        timeout_sec=1.2,
+        timeout=1.2,
     )
     if isinstance(d_data, dict) and isinstance(d_data.get("result"), dict):
         raw_desc = d_data["result"].get("description")
         if raw_desc:
-            desc_text = html.escape(str(raw_desc).strip()[:250])
+            desc_text = html.escape(str(raw_desc).strip()[:220])
 
-    _, c_data, _ = _http_get_json_fast(
+    _, c_data, _ = _fast_get_json(
         f"https://api.telegram.org/bot{token}/getMyCommands",
-        timeout_sec=1.2,
+        timeout=1.2,
     )
     if isinstance(c_data, dict) and isinstance(c_data.get("result"), list):
         parsed = [
             html.escape(f"/{c.get('command', '')}")
-            for c in c_data["result"][:12]
+            for c in c_data["result"][:10]
             if isinstance(c, dict) and c.get("command")
         ]
         if parsed:
             cmds_text = ", ".join(parsed)
 
-    _, wh_data, _ = _http_get_json_fast(
+    _, wh_data, _ = _fast_get_json(
         f"https://api.telegram.org/bot{token}/getWebhookInfo",
-        timeout_sec=1.2,
+        timeout=1.2,
     )
     if isinstance(wh_data, dict) and isinstance(wh_data.get("result"), dict):
         wh_res = wh_data["result"]
@@ -608,10 +607,9 @@ def _inspect_telegram_fast(
         pending = int(wh_res.get("pending_update_count") or 0)
         last_err = str(wh_res.get("last_error_message") or "").strip()
         if wh_url:
-            safe_wh = html.escape(wh_url[:100])
-            wh_text = f"<code>{safe_wh}</code> (очередь: {pending})"
+            wh_text = f"<code>{html.escape(wh_url[:90])}</code> (очередь: {pending})"
             if last_err:
-                wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:100])}</code>"
+                wh_text += f"\n⚠️ <b>Ошибка WH:</b> <code>{html.escape(last_err[:90])}</code>"
         else:
             wh_text = f"Не задан (очередь: {pending})"
 
@@ -623,92 +621,53 @@ def _inspect_telegram_fast(
     return True, str(username), is_scam, dossier, None
 
 
-def _inspect_discord_token_fast(
-    token: str,
-) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    code, data, err = _http_get_json_fast(
+def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    code, data, err = _fast_get_json(
         "https://discord.com/api/v10/users/@me",
         headers={"Authorization": f"Bot {token}"},
-        timeout_sec=CHECK_SOCKET_TIMEOUT,
+        timeout=2.5,
     )
     if code == 200 and isinstance(data, dict):
         username = data.get("username") or "DiscordBot"
         discriminator = data.get("discriminator")
-        if discriminator and discriminator != "0":
-            display_name = f"{username}#{discriminator}"
-        else:
-            display_name = str(username)
-
+        display_name = (
+            f"{username}#{discriminator}"
+            if discriminator and discriminator != "0"
+            else str(username)
+        )
         is_scam = any(word in display_name.lower() for word in SCAM_KEYWORDS)
         return True, display_name, is_scam, "🤖 Discord Bot Token активен", None
     return False, None, False, "", err or f"HTTP {code}"
 
 
-def _inspect_discord_webhook_fast(
-    webhook_url: str,
-) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    code, data, err = _http_get_json_fast(
-        webhook_url,
-        timeout_sec=CHECK_SOCKET_TIMEOUT,
-    )
+def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
+    code, data, err = _fast_get_json(webhook_url, timeout=2.5)
     if code == 200 and isinstance(data, dict):
         name = data.get("name") or "Webhook"
-        channel_id = data.get("channel_id")
-        guild_id = data.get("guild_id")
-        parts = [str(name)]
-        if guild_id:
-            parts.append(f"srv:{guild_id}")
-        if channel_id:
-            parts.append(f"ch:{channel_id}")
-        label = " / ".join(parts)
+        ch_id = data.get("channel_id")
+        label = f"{name} (ch:{ch_id})" if ch_id else str(name)
         return True, label, True, "🪝 Активный Discord Webhook", None
     return False, None, False, "", err or f"HTTP {code}"
 
 
-def _check_in_daemon_thread(
-    f_type: str,
-    target: str,
-    out_box: List[Tuple[bool, Optional[str], bool, str, Optional[str]]],
-) -> None:
-    try:
-        if f_type == "Telegram":
-            res = _inspect_telegram_fast(target)
-        elif f_type == "Discord":
-            res = _inspect_discord_token_fast(target)
-        elif f_type == "Webhook":
-            res = _inspect_discord_webhook_fast(target)
-        else:
-            res = (False, None, False, "", "unknown type")
-        if not out_box:
-            out_box.append(res)
-    except Exception as exc:
-        if not out_box:
-            out_box.append((False, None, False, "", str(exc)[:28]))
-
-
-def check_finding_hard_timeout(
+def check_finding_direct(
     f_type: str, target: str
 ) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    out_box: List[Tuple[bool, Optional[str], bool, str, Optional[str]]] = []
-    t = threading.Thread(
-        target=_check_in_daemon_thread,
-        args=(f_type, target, out_box),
-        daemon=True,
-    )
-    t.start()
-    t.join(timeout=CHECK_HARD_TIMEOUT)
-
-    if out_box:
-        return out_box[0]
-    return False, None, False, "", f"таймаут {CHECK_HARD_TIMEOUT}с"
+    if f_type == "Telegram":
+        return check_telegram_token(target)
+    if f_type == "Discord":
+        return check_discord_token(target)
+    if f_type == "Webhook":
+        return check_discord_webhook(target)
+    return False, None, False, "", "unknown type"
 
 
 def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
     cleaned = raw_input.strip()
 
+    wh_match = DISCORD_WEBHOOK_RE.search(cleaned)
     tg_match = TG_TOKEN_RE.search(cleaned)
     dc_match = DISCORD_TOKEN_RE.search(cleaned)
-    wh_match = DISCORD_WEBHOOK_RE.search(cleaned)
 
     if wh_match:
         target = wh_match.group(0).strip()
@@ -727,7 +686,7 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
             None,
         )
 
-    is_live, label, is_scam, dossier, err_reason = check_finding_hard_timeout(f_type, target)
+    is_live, label, is_scam, dossier, err_reason = check_finding_direct(f_type, target)
 
     safe_type = html.escape(f_type)
     safe_target = html.escape(target)
@@ -885,7 +844,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             "https://api.github.com/search/code",
             headers=headers,
             params=params,
-            timeout=(2.5, 6.0),
+            timeout=6.0,
         )
 
         if resp.status_code == 401:
@@ -937,11 +896,11 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
         return findings, 200
 
     except requests.RequestException as exc:
-        add_log(f"⚠️ Сетевая ошибка GitHub: {str(exc)[:50]}")
+        add_log(f"⚠️ Сетевая ошибка GitHub: {str(exc)[:45]}")
         _sleep_respecting_stop(7)
         return [], 500
     except Exception as exc:
-        add_log(f"❌ Ошибка парсинга GitHub: {str(exc)[:50]}")
+        add_log(f"❌ Ошибка парсинга GitHub: {str(exc)[:45]}")
         _sleep_respecting_stop(7)
         return [], 500
 
@@ -972,7 +931,7 @@ def search_gitlab() -> List[Dict[str, str]]:
             "https://gitlab.com/api/v4/search",
             headers=headers,
             params=params,
-            timeout=(2.5, 6.0),
+            timeout=5.0,
         )
         if resp.status_code == 401:
             notify_critical_error(
@@ -989,7 +948,7 @@ def search_gitlab() -> List[Dict[str, str]]:
         if not isinstance(blobs, list):
             return []
 
-        for blob in blobs[:6]:
+        for blob in blobs[:5]:
             with state_lock:
                 if search_state["stop_requested"]:
                     break
@@ -1011,7 +970,7 @@ def search_gitlab() -> List[Dict[str, str]]:
                     raw_url,
                     headers=headers,
                     params={"ref": ref},
-                    timeout=(2.0, 2.5),
+                    timeout=2.5,
                 )
                 if raw_resp.status_code != 200:
                     continue
@@ -1033,7 +992,7 @@ def search_gitlab() -> List[Dict[str, str]]:
                 continue
 
     except Exception as exc:
-        add_log(f"⚠️ Ошибка GitLab: {str(exc)[:50]}")
+        add_log(f"⚠️ Ошибка GitLab: {str(exc)[:45]}")
 
     return findings
 
@@ -1266,7 +1225,7 @@ def favicon():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()}), 200
+    return jsonify({"status": "ok", "timestamp": now_kyiv().isoformat()}), 200
 
 
 @app.route("/api/stats")
@@ -1867,7 +1826,7 @@ def cb_export_db(call: types.CallbackQuery):
         bot.answer_callback_query(call.id, "База пуста, нечего экспортировать.")
         return
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = kyiv_time_str("%Y%m%d_%H%M%S")
     fmt = call.data.split("_", 1)[1]
 
     if fmt == "txt":
@@ -2101,7 +2060,7 @@ def live_ui_updater(chat_id: int, msg_id: int) -> None:
 
         update_progress_message(chat_id, msg_id, spinner_idx)
         spinner_idx += 1
-        _sleep_respecting_stop(7)
+        _sleep_respecting_stop(6)
 
 
 def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> None:
@@ -2163,7 +2122,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     url = finding.get("url", "")
 
     add_log(f"🔎 Проверяю {f_type} из {repo}...")
-    is_live, bot_name, is_scam, dossier, err_reason = check_finding_hard_timeout(f_type, token)
+    is_live, bot_name, is_scam, dossier, err_reason = check_finding_direct(f_type, token)
 
     with state_lock:
         search_state["checked_tokens"] += 1
@@ -2232,7 +2191,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
             disable_web_page_preview=True,
         )
     except Exception as exc:
-        add_log(f"⚠️ Не удалось отправить карточку в TG: {exc}")
+        add_log(f"⚠️ Не удалось отправить карточку в TG: {str(exc)[:35]}")
 
 
 def _build_final_summary(snap: Dict[str, Any]) -> str:
@@ -2295,9 +2254,9 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                     executor.submit(process_single_finding, item, chat_id)
                     for item in raw_findings
                 ]
-                for fut in concurrent.futures.as_completed(futures, timeout=10):
+                for fut in concurrent.futures.as_completed(futures, timeout=15):
                     try:
-                        fut.result(timeout=CHECK_HARD_TIMEOUT + 0.5)
+                        fut.result(timeout=8.0)
                     except Exception as exc:
                         add_log(f"⚠️ Воркер пропущен: {str(exc)[:30]}")
 
