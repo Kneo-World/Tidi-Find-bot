@@ -18,7 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import telebot
 from telebot import types, apihelper
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 
 import matplotlib
 matplotlib.use("Agg")
@@ -48,13 +48,14 @@ SHEET_NAME = os.getenv("SHEET_NAME", "").strip()
 
 SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 MAX_LOG_LINES = 15
+REQUEST_TIMEOUT: Tuple[float, float] = (3.0, 5.0)
 
 if not CONTROL_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения CONTROL_BOT_TOKEN!")
 
-bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=8)
+bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=6)
 app = Flask(__name__)
 
 # Потокобезопасная HTTP-сессия с увеличенным пулом соединений
@@ -63,7 +64,7 @@ _adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=1)
 http_session.mount("https://", _adapter)
 http_session.mount("http://", _adapter)
 http_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/7.0 (+https://github.com)"
+    "User-Agent": "HunterPRO-Scanner/7.1 (+https://github.com)"
 })
 
 
@@ -119,10 +120,6 @@ SCAM_KEYWORDS = [
     "проверка", "гарант", "escrow", "drain", "stealer", "seed", "wallet"
 ]
 
-# Режимы фильтрации находок во время сессии:
-# "all"      -> отправлять и сохранять все живые находки
-# "no_scam"  -> только не-скам (исключая подозрительных и webhook)
-# "tg_only"  -> только живые Telegram-боты
 FILTER_MODES = {
     "all": "Все живые",
     "no_scam": "Только не-скам",
@@ -158,10 +155,7 @@ search_state: Dict[str, Any] = {
     "phrase": "Готов к работе",
 }
 
-# Ожидание ручной проверки токена/вебхука по user_id
 awaiting_manual_check: Dict[int, float] = {}
-
-# Чтобы критические ошибки не слались спамом каждую секунду
 sent_critical_alerts: set = set()
 
 _cached_worksheet = None
@@ -240,7 +234,6 @@ def get_state_snapshot() -> Dict[str, Any]:
 
 
 def notify_critical_error(alert_key: str, title: str, details: str) -> None:
-    """Отправляет одно понятное предупреждение об ошибке в админку (без спама)."""
     add_log(f"🚨 {title}: {details}")
     with alert_lock:
         if alert_key in sent_critical_alerts:
@@ -481,13 +474,13 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# ПРОВЕРКА ТОКЕНОВ, ВЕБХУКОВ И РУЧНАЯ ПРОВЕРКА
+# ПРОВЕРКА ТОКЕНОВ, ВЕБХУКОВ И РУЧНАЯ ПРОВЕРКА (С ЖЁСТКИМИ ТАЙМАУТАМИ)
 # =====================================================================
 def get_telegram_bot_dossier(token: str) -> str:
     try:
         desc_resp = http_session.get(
             f"https://api.telegram.org/bot{token}/getMyDescription",
-            timeout=6,
+            timeout=REQUEST_TIMEOUT,
         )
         desc_data = desc_resp.json() if desc_resp.ok else {}
         raw_desc = desc_data.get("result", {}).get("description") or "Нет описания"
@@ -495,7 +488,7 @@ def get_telegram_bot_dossier(token: str) -> str:
 
         cmd_resp = http_session.get(
             f"https://api.telegram.org/bot{token}/getMyCommands",
-            timeout=6,
+            timeout=REQUEST_TIMEOUT,
         )
         cmd_data = cmd_resp.json() if cmd_resp.ok else {}
         raw_cmds = cmd_data.get("result") or []
@@ -513,12 +506,12 @@ def get_telegram_bot_dossier(token: str) -> str:
         return "Не удалось загрузить полное досье."
 
 
-def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str]:
+def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
     url = f"https://api.telegram.org/bot{token}/getMe"
     try:
-        resp = http_session.get(url, timeout=6)
+        resp = http_session.get(url, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            return False, None, False, ""
+            return False, None, False, "", f"HTTP {resp.status_code}"
         payload = resp.json()
         if payload.get("ok") and isinstance(payload.get("result"), dict):
             result = payload["result"]
@@ -531,17 +524,19 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str]:
                 for word in SCAM_KEYWORDS
             )
             dossier = get_telegram_bot_dossier(token)
-            return True, str(username), is_suspicious, dossier
-    except Exception:
-        pass
-    return False, None, False, ""
+            return True, str(username), is_suspicious, dossier, None
+        return False, None, False, "", "ok=false"
+    except requests.Timeout:
+        return False, None, False, "", "таймаут"
+    except Exception as exc:
+        return False, None, False, "", str(exc)[:30]
 
 
-def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str]:
+def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
     url = "https://discord.com/api/v10/users/@me"
     headers = {"Authorization": f"Bot {token}"}
     try:
-        resp = http_session.get(url, headers=headers, timeout=6)
+        resp = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             username = data.get("username") or "DiscordBot"
@@ -553,31 +548,31 @@ def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str]:
 
             lower_name = display_name.lower()
             is_suspicious = any(word in lower_name for word in SCAM_KEYWORDS)
-            return True, display_name, is_suspicious, "🤖 Discord Bot Token активен"
-    except Exception:
-        pass
-    return False, None, False, ""
+            return True, display_name, is_suspicious, "🤖 Discord Bot Token активен", None
+        return False, None, False, "", f"HTTP {resp.status_code}"
+    except requests.Timeout:
+        return False, None, False, "", "таймаут"
+    except Exception as exc:
+        return False, None, False, "", str(exc)[:30]
 
 
-def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str]]:
+def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str], Optional[str]]:
     try:
-        resp = http_session.get(webhook_url, timeout=6)
+        resp = http_session.get(webhook_url, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             name = data.get("name") or "Webhook"
             channel_id = data.get("channel_id")
             label = f"{name} (ch:{channel_id})" if channel_id else str(name)
-            return True, label
-    except Exception:
-        pass
-    return False, None
+            return True, label, None
+        return False, None, f"HTTP {resp.status_code}"
+    except requests.Timeout:
+        return False, None, "таймаут"
+    except Exception as exc:
+        return False, None, str(exc)[:30]
 
 
 def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """
-    Ручная проверка строки с Telegram-токеном, Discord-токеном или Discord Webhook URL.
-    Возвращает (текст_отчёта_HTML, token_info_если_живой).
-    """
     cleaned = raw_input.strip()
 
     tg_match = TG_TOKEN_RE.search(cleaned)
@@ -587,17 +582,17 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
     if wh_match:
         target = wh_match.group(0).strip()
         f_type = "Webhook"
-        is_live, label = check_discord_webhook(target)
+        is_live, label, err_reason = check_discord_webhook(target)
         is_scam = True
         dossier = "🪝 Discord Webhook (потенциально опасный / используется для слива логов)"
     elif tg_match:
         target = tg_match.group(0).strip()
         f_type = "Telegram"
-        is_live, label, is_scam, dossier = check_telegram_token(target)
+        is_live, label, is_scam, dossier, err_reason = check_telegram_token(target)
     elif dc_match:
         target = dc_match.group(0).strip()
         f_type = "Discord"
-        is_live, label, is_scam, dossier = check_discord_token(target)
+        is_live, label, is_scam, dossier, err_reason = check_discord_token(target)
     else:
         return (
             "⚠️ <b>Не удалось распознать ключ или webhook.</b>\n"
@@ -611,10 +606,11 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
     safe_label = html.escape(str(label or "Неизвестно"))
 
     if not is_live:
+        reason_line = f"\nПричина: <code>{html.escape(err_reason)}</code>" if err_reason else ""
         report = (
             f"🧪 <b>Ручная проверка ({safe_type})</b>\n\n"
             f"🔑 Цель: <code>{safe_target}</code>\n"
-            f"📡 Статус: ❌ <b>МЁРТВЫЙ / НЕАКТИВЕН</b>"
+            f"📡 Статус: ❌ <b>МЁРТВЫЙ / НЕАКТИВЕН</b>{reason_line}"
         )
         return report, None
 
@@ -720,7 +716,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
     }
     params = {
         "q": query,
-        "per_page": 50,
+        "per_page": 30,
         "page": random.randint(1, 2),
         "sort": "indexed",
         "order": "desc",
@@ -731,7 +727,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             "https://api.github.com/search/code",
             headers=headers,
             params=params,
-            timeout=15,
+            timeout=(4.0, 12.0),
         )
 
         if resp.status_code == 401:
@@ -776,6 +772,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
                 seen_tokens.add(item_found["token"])
                 findings.append(item_found)
 
+        add_log(f"📦 GitHub нашёл кандидатов: {len(findings)}")
         _sleep_respecting_stop(8)
         return findings, 200
 
@@ -799,14 +796,14 @@ def search_gitlab() -> List[Dict[str, str]]:
     set_status(search_state["status_text"], f"GitLab: {query}")
 
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
-    params = {"scope": "blobs", "search": query, "per_page": 10}
+    params = {"scope": "blobs", "search": query, "per_page": 8}
 
     try:
         resp = http_session.get(
             "https://gitlab.com/api/v4/search",
             headers=headers,
             params=params,
-            timeout=15,
+            timeout=(4.0, 12.0),
         )
         if resp.status_code == 401:
             notify_critical_error(
@@ -823,7 +820,7 @@ def search_gitlab() -> List[Dict[str, str]]:
         if not isinstance(blobs, list):
             return []
 
-        for blob in blobs[:8]:
+        for blob in blobs[:6]:
             with state_lock:
                 if search_state["stop_requested"]:
                     break
@@ -845,7 +842,7 @@ def search_gitlab() -> List[Dict[str, str]]:
                     raw_url,
                     headers=headers,
                     params={"ref": ref},
-                    timeout=10,
+                    timeout=REQUEST_TIMEOUT,
                 )
                 if raw_resp.status_code != 200:
                     continue
@@ -998,8 +995,6 @@ HTML_TEMPLATE = """
         .recent-item:last-child {
             border-bottom: none;
         }
-        .badge-scam { color: #ffb703; font-weight: bold; }
-        .badge-ok { color: #00ff88; font-weight: bold; }
     </style>
     <script>
         function updateData() {
@@ -1087,6 +1082,11 @@ HTML_TEMPLATE = """
 @app.route("/")
 def home():
     return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
 
 
 @app.route("/health")
@@ -1487,6 +1487,7 @@ def stop_command(message: types.Message):
     with state_lock:
         search_state["stop_requested"] = True
         search_state["status_text"] = "Остановка..."
+    add_log("⏹️ Команда остановки из меню бота")
     bot.send_message(message.chat.id, "⏹️ Команда остановки принята.")
 
 
@@ -1708,6 +1709,7 @@ def cb_stop_search(call: types.CallbackQuery):
     with state_lock:
         search_state["stop_requested"] = True
         search_state["status_text"] = "Остановка..."
+    add_log("⏹️ Нажата инлайн-кнопка Стоп")
     bot.answer_callback_query(call.id, "Останавливаю поиск...")
 
 
@@ -1724,7 +1726,6 @@ def cb_force_update(call: types.CallbackQuery):
         update_progress_message(call.message.chat.id, call.message.message_id)
 
 
-# Перехват текстового сообщения, если админ нажал «Проверка токена» и ждёт ввод ключа
 @bot.message_handler(
     func=lambda m: bool(m.text) and not m.text.startswith("/") and m.text not in {
         "🚀 Начать поиск",
@@ -1784,6 +1785,8 @@ def start_search_command(message: types.Message):
             "logs": [],
             "phrase": "Инициализация сканера...",
         })
+
+    add_log("🚀 Старт поисковой сессии")
 
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
         threading.Thread(target=get_google_worksheet, daemon=True).start()
@@ -1877,14 +1880,18 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     repo = finding.get("repo", "unknown")
     url = finding.get("url", "")
 
-    add_log(f"🔍 Проверка {f_type} из {repo[:24]}...")
+    err_reason: Optional[str] = None
+    bot_name: Optional[str] = None
+    is_live = False
+    is_scam = False
+    dossier = ""
 
     if f_type == "Telegram":
-        is_live, bot_name, is_scam, dossier = check_telegram_token(token)
+        is_live, bot_name, is_scam, dossier, err_reason = check_telegram_token(token)
     elif f_type == "Discord":
-        is_live, bot_name, is_scam, dossier = check_discord_token(token)
+        is_live, bot_name, is_scam, dossier, err_reason = check_discord_token(token)
     elif f_type == "Webhook":
-        is_live, bot_name = check_discord_webhook(token)
+        is_live, bot_name, err_reason = check_discord_webhook(token)
         is_scam = True
         dossier = "🪝 Активный Discord Webhook (часто используется для слива данных)"
     else:
@@ -1892,9 +1899,11 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
 
     with state_lock:
         search_state["checked_tokens"] += 1
+        checked_now = search_state["checked_tokens"]
         if not is_live:
             search_state["dead_tokens"] += 1
-            add_log(f"❌ Мёртвый {f_type}")
+            suffix = f" ({err_reason})" if err_reason else ""
+            add_log(f"❌ #{checked_now} Мёртвый {f_type}{suffix}")
             return
 
         if search_state["found_live_current"] >= search_state["limit_live"]:
@@ -1903,7 +1912,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         cur_filter = search_state["filter_mode"]
         if not _matches_session_filter(f_type, is_scam, cur_filter):
             search_state["skipped_by_filter"] += 1
-            add_log(f"⏭️ Пропущено фильтром [{cur_filter}]: {f_type} ({bot_name})")
+            add_log(f"⏭️ #{checked_now} Пропущено фильтром [{cur_filter}]: {f_type}")
             return
 
         search_state["found_live_current"] += 1
@@ -1927,7 +1936,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         "scam": is_scam,
     }
     save_live_token(token_info)
-    add_log(f"🟢 БИНГО! {f_type}: {bot_name}")
+    add_log(f"🟢 #{checked_now} БИНГО! {f_type}: {bot_name}")
 
     safe_type = html.escape(f_type)
     safe_bot = html.escape(str(bot_name or "Unknown"))
@@ -2015,9 +2024,9 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                     executor.submit(process_single_finding, item, chat_id)
                     for item in raw_findings
                 ]
-                for fut in concurrent.futures.as_completed(futures, timeout=30):
+                for fut in concurrent.futures.as_completed(futures, timeout=25):
                     try:
-                        fut.result(timeout=5)
+                        fut.result(timeout=4)
                     except Exception as exc:
                         add_log(f"⚠️ Ошибка воркера: {exc}")
 
