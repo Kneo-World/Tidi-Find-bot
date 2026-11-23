@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import csv
 import html
 import time
 import json
@@ -14,9 +15,10 @@ from datetime import datetime
 from collections import Counter
 
 import requests
+from requests.adapters import HTTPAdapter
 import telebot
 from telebot import types, apihelper
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 import matplotlib
 matplotlib.use("Agg")
@@ -55,10 +57,13 @@ if not CONTROL_BOT_TOKEN:
 bot = telebot.TeleBot(CONTROL_BOT_TOKEN, threaded=True, num_threads=8)
 app = Flask(__name__)
 
-# Общая HTTP-сессия для переиспользования соединений
+# Потокобезопасная HTTP-сессия с увеличенным пулом соединений
 http_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=1)
+http_session.mount("https://", _adapter)
+http_session.mount("http://", _adapter)
 http_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/6.0 (+https://github.com)"
+    "User-Agent": "HunterPRO-Scanner/7.0 (+https://github.com)"
 })
 
 
@@ -114,22 +119,38 @@ SCAM_KEYWORDS = [
     "проверка", "гарант", "escrow", "drain", "stealer", "seed", "wallet"
 ]
 
+# Режимы фильтрации находок во время сессии:
+# "all"      -> отправлять и сохранять все живые находки
+# "no_scam"  -> только не-скам (исключая подозрительных и webhook)
+# "tg_only"  -> только живые Telegram-боты
+FILTER_MODES = {
+    "all": "Все живые",
+    "no_scam": "Только не-скам",
+    "tg_only": "Только Telegram",
+}
+
 
 # =====================================================================
-# СОСТОЯНИЕ И БЛОКИРОВКИ
+# СОСТОЯНИЕ, ОЧЕРЕДИ РУЧНОЙ ПРОВЕРКИ И БЛОКИРОВКИ
 # =====================================================================
 db_lock = threading.RLock()
 sheets_lock = threading.Lock()
 state_lock = threading.Lock()
+alert_lock = threading.Lock()
 
 search_state: Dict[str, Any] = {
     "is_searching": False,
     "stop_requested": False,
     "limit_live": 5,
+    "filter_mode": "all",
     "found_live_current": 0,
+    "skipped_by_filter": 0,
     "checked_tokens": 0,
     "dead_tokens": 0,
     "scam_tokens": 0,
+    "tg_found": 0,
+    "dc_found": 0,
+    "wh_found": 0,
     "start_time": None,
     "current_query": "Ожидание запуска...",
     "status_text": "Ожидание...",
@@ -137,13 +158,19 @@ search_state: Dict[str, Any] = {
     "phrase": "Готов к работе",
 }
 
+# Ожидание ручной проверки токена/вебхука по user_id
+awaiting_manual_check: Dict[int, float] = {}
+
+# Чтобы критические ошибки не слались спамом каждую секунду
+sent_critical_alerts: set = set()
+
 _cached_worksheet = None
 _sheets_init_attempted = False
 _sheets_last_error = ""
 
 
 # =====================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АЛЕРТЫ
 # =====================================================================
 def is_admin(chat_id: Optional[int], user_id: Optional[int] = None) -> bool:
     if ADMIN_ID <= 0:
@@ -194,10 +221,15 @@ def get_state_snapshot() -> Dict[str, Any]:
             "is_searching": search_state["is_searching"],
             "stop_requested": search_state["stop_requested"],
             "limit_live": search_state["limit_live"],
+            "filter_mode": search_state["filter_mode"],
             "found_live_current": search_state["found_live_current"],
+            "skipped_by_filter": search_state["skipped_by_filter"],
             "checked_tokens": search_state["checked_tokens"],
             "dead_tokens": search_state["dead_tokens"],
             "scam_tokens": search_state["scam_tokens"],
+            "tg_found": search_state["tg_found"],
+            "dc_found": search_state["dc_found"],
+            "wh_found": search_state["wh_found"],
             "elapsed_seconds": elapsed,
             "time": format_time(elapsed),
             "current_query": search_state["current_query"],
@@ -207,13 +239,48 @@ def get_state_snapshot() -> Dict[str, Any]:
         }
 
 
+def notify_critical_error(alert_key: str, title: str, details: str) -> None:
+    """Отправляет одно понятное предупреждение об ошибке в админку (без спама)."""
+    add_log(f"🚨 {title}: {details}")
+    with alert_lock:
+        if alert_key in sent_critical_alerts:
+            return
+        sent_critical_alerts.add(alert_key)
+
+    target_chat = ADMIN_ID if ADMIN_ID > 0 else None
+    if not target_chat:
+        return
+
+    safe_title = html.escape(title)
+    safe_details = html.escape(details)
+    text = (
+        f"🚨 <b>КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ</b>\n\n"
+        f"<b>{safe_title}</b>\n"
+        f"<code>{safe_details}</code>\n\n"
+        f"<i>Повторное оповещение по этой проблеме подавлено до перезапуска.</i>"
+    )
+    try:
+        bot.send_message(
+            target_chat,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as send_err:
+        print(f"[ALERT] Не удалось отправить алерт админу: {send_err}", flush=True)
+
+
+def reset_critical_alert(alert_key: str) -> None:
+    with alert_lock:
+        sent_critical_alerts.discard(alert_key)
+
+
 # =====================================================================
-# GOOGLE SHEETS (КЭШИРОВАНИЕ + ПОДРОБНАЯ ДИАГНОСТИКА ОШИБОК)
+# GOOGLE SHEETS (КЭШИРОВАНИЕ + АЛЕРТЫ ПРИ ОШИБКАХ)
 # =====================================================================
 def _parse_google_credentials() -> Dict[str, Any]:
     if GOOGLE_CREDS_B64:
         raw_b64 = GOOGLE_CREDS_B64.strip()
-        # Поддержка URL-safe base64 и отсутствующего padding '='
         missing_padding = len(raw_b64) % 4
         if missing_padding:
             raw_b64 += "=" * (4 - missing_padding)
@@ -221,7 +288,6 @@ def _parse_google_credentials() -> Dict[str, Any]:
             decoded = base64.b64decode(raw_b64).decode("utf-8")
             return json.loads(decoded)
         except Exception as b64_err:
-            # На случай если в GOOGLE_CREDS_B64 положили обычный JSON
             try:
                 return json.loads(GOOGLE_CREDS_B64)
             except Exception:
@@ -263,7 +329,6 @@ def get_google_worksheet(force_reconnect: bool = False):
             else:
                 worksheet = spreadsheet.sheet1
 
-            # Проверяем первую строку — если лист пустой, добавляем заголовки
             first_row = worksheet.row_values(1)
             if not first_row:
                 worksheet.append_row([
@@ -277,12 +342,17 @@ def get_google_worksheet(force_reconnect: bool = False):
 
             _cached_worksheet = worksheet
             _sheets_last_error = ""
+            reset_critical_alert("sheets_error")
             add_log(f"☁️ Google Sheets подключён: '{spreadsheet.title}' -> '{worksheet.title}'")
             return _cached_worksheet
 
         except Exception as exc:
             _sheets_last_error = str(exc)
-            add_log(f"❌ Ошибка инициализации Google Sheets: {_sheets_last_error}")
+            notify_critical_error(
+                "sheets_error",
+                "Отвалился или не настроен Google Sheets",
+                _sheets_last_error,
+            )
             return None
 
 
@@ -307,19 +377,24 @@ def save_to_google_sheets(data: Dict[str, Any]) -> bool:
 
         try:
             worksheet.append_row(row, value_input_option="USER_ENTERED")
+            reset_critical_alert("sheets_write_error")
             add_log("☁️ Записано в Google Таблицу!")
             return True
         except Exception as exc:
-            # Пробуем переподключиться один раз (например, при протухшем токене доступа)
-            add_log(f"⚠️ Повторное подключение к Google Sheets ({exc})...")
+            add_log(f"⚠️ Переподключаюсь к Google Sheets ({exc})...")
             worksheet = get_google_worksheet(force_reconnect=True)
             if worksheet is not None:
                 try:
                     worksheet.append_row(row, value_input_option="USER_ENTERED")
+                    reset_critical_alert("sheets_write_error")
                     add_log("☁️ Записано в Google Таблицу после реконнекта!")
                     return True
                 except Exception as retry_exc:
-                    add_log(f"❌ Ошибка записи в Google Sheets: {retry_exc}")
+                    notify_critical_error(
+                        "sheets_write_error",
+                        "Ошибка записи строки в Google Sheets",
+                        str(retry_exc),
+                    )
                     return False
             return False
 
@@ -406,7 +481,7 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ + ДОСЬЕ
+# ПРОВЕРКА ТОКЕНОВ, ВЕБХУКОВ И РУЧНАЯ ПРОВЕРКА
 # =====================================================================
 def get_telegram_bot_dossier(token: str) -> str:
     try:
@@ -498,6 +573,72 @@ def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
+def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Ручная проверка строки с Telegram-токеном, Discord-токеном или Discord Webhook URL.
+    Возвращает (текст_отчёта_HTML, token_info_если_живой).
+    """
+    cleaned = raw_input.strip()
+
+    tg_match = TG_TOKEN_RE.search(cleaned)
+    dc_match = DISCORD_TOKEN_RE.search(cleaned)
+    wh_match = DISCORD_WEBHOOK_RE.search(cleaned)
+
+    if wh_match:
+        target = wh_match.group(0).strip()
+        f_type = "Webhook"
+        is_live, label = check_discord_webhook(target)
+        is_scam = True
+        dossier = "🪝 Discord Webhook (потенциально опасный / используется для слива логов)"
+    elif tg_match:
+        target = tg_match.group(0).strip()
+        f_type = "Telegram"
+        is_live, label, is_scam, dossier = check_telegram_token(target)
+    elif dc_match:
+        target = dc_match.group(0).strip()
+        f_type = "Discord"
+        is_live, label, is_scam, dossier = check_discord_token(target)
+    else:
+        return (
+            "⚠️ <b>Не удалось распознать ключ или webhook.</b>\n"
+            "Пришли формат Telegram-токена (<code>123456789:AA...</code>), "
+            "Discord Bot Token или ссылку <code>https://discord.com/api/webhooks/...</code>.",
+            None,
+        )
+
+    safe_type = html.escape(f_type)
+    safe_target = html.escape(target)
+    safe_label = html.escape(str(label or "Неизвестно"))
+
+    if not is_live:
+        report = (
+            f"🧪 <b>Ручная проверка ({safe_type})</b>\n\n"
+            f"🔑 Цель: <code>{safe_target}</code>\n"
+            f"📡 Статус: ❌ <b>МЁРТВЫЙ / НЕАКТИВЕН</b>"
+        )
+        return report, None
+
+    scam_badge = "⚠️ СКАМ / ПОДОЗРИТЕЛЬНО" if is_scam else "✅ НОРМ"
+    report = (
+        f"🧪 <b>Ручная проверка ({safe_type})</b>\n\n"
+        f"📡 Статус: 🟢 <b>ЖИВОЙ / АКТИВЕН</b>\n"
+        f"🏷 Оценка: <b>{scam_badge}</b>\n"
+        f"🤖 Имя / Цель: <b>{safe_label}</b>\n"
+        f"🔑 Ключ: <code>{safe_target}</code>\n\n"
+        f"📄 <b>Досье:</b>\n{dossier}"
+    )
+
+    token_info = {
+        "type": f_type,
+        "token": target,
+        "repo": "manual/check",
+        "url": "manual-check",
+        "bot": label or "Unknown",
+        "scam": is_scam,
+    }
+    return report, token_info
+
+
 def extract_findings_from_text(
     text: str,
     repo_full_name: str,
@@ -548,8 +689,12 @@ def _sleep_respecting_stop(seconds: float) -> None:
 
 def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
     if not GITHUB_TOKEN:
-        add_log("⚠️ GITHUB_TOKEN не задан — пропуск поиска на GitHub")
-        _sleep_respecting_stop(5)
+        notify_critical_error(
+            "github_missing_token",
+            "Отсутствует GITHUB_TOKEN",
+            "Переменная окружения GITHUB_TOKEN пуста — поиск по GitHub отключён.",
+        )
+        _sleep_respecting_stop(6)
         return [], 401
 
     findings: List[Dict[str, str]] = []
@@ -591,7 +736,11 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
 
         if resp.status_code == 401:
             set_status("❌ Ошибка авторизации GitHub Token!")
-            add_log("❌ GitHub вернул 401 Unauthorized. Проверь GITHUB_TOKEN.")
+            notify_critical_error(
+                "github_401",
+                "Слетел или невалиден GITHUB_TOKEN (HTTP 401)",
+                "GitHub API отклонил токен. Обнови GITHUB_TOKEN в переменных окружения.",
+            )
             with state_lock:
                 search_state["stop_requested"] = True
             return [], 401
@@ -608,6 +757,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             return [], resp.status_code
 
         resp.raise_for_status()
+        reset_critical_alert("github_401")
         items = resp.json().get("items") or []
 
         for item in items:
@@ -658,9 +808,17 @@ def search_gitlab() -> List[Dict[str, str]]:
             params=params,
             timeout=15,
         )
+        if resp.status_code == 401:
+            notify_critical_error(
+                "gitlab_401",
+                "Слетел или невалиден GITLAB_TOKEN (HTTP 401)",
+                "GitLab API вернул 401 Unauthorized. Проверь токен GitLab.",
+            )
+            return []
         if resp.status_code != 200:
             return []
 
+        reset_critical_alert("gitlab_401")
         blobs = resp.json()
         if not isinstance(blobs, list):
             return []
@@ -720,7 +878,11 @@ def generate_stats_chart() -> io.BytesIO:
     snap = get_state_snapshot()
     live_saved = len(load_live_tokens())
 
-    live_count = max(snap["found_live_current"], live_saved) if snap["found_live_current"] == 0 else snap["found_live_current"]
+    live_count = (
+        max(snap["found_live_current"], live_saved)
+        if snap["found_live_current"] == 0
+        else snap["found_live_current"]
+    )
     dead_count = snap["dead_tokens"]
     scam_count = snap["scam_tokens"]
 
@@ -761,7 +923,7 @@ def generate_stats_chart() -> io.BytesIO:
 
 
 # =====================================================================
-# FLASK ВЕБ-ДАШБОРД
+# FLASK ВЕБ-ДАШБОРД И API УПРАВЛЕНИЯ
 # =====================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -778,7 +940,7 @@ HTML_TEMPLATE = """
             margin: 0;
         }
         .container {
-            max-width: 900px;
+            max-width: 960px;
             margin: 0 auto;
         }
         h1 {
@@ -796,11 +958,11 @@ HTML_TEMPLATE = """
         .grid {
             display: flex;
             flex-wrap: wrap;
-            gap: 16px;
-            margin-bottom: 10px;
+            gap: 14px;
+            margin-bottom: 12px;
         }
         .stat-box {
-            flex: 1 1 160px;
+            flex: 1 1 150px;
             background: #0d1117;
             border: 1px solid #30363d;
             border-radius: 6px;
@@ -811,7 +973,7 @@ HTML_TEMPLATE = """
             font-size: 0.85em;
         }
         .value {
-            font-size: 1.3em;
+            font-size: 1.25em;
             font-weight: bold;
             margin-top: 4px;
         }
@@ -827,6 +989,17 @@ HTML_TEMPLATE = """
             max-height: 360px;
             overflow-y: auto;
         }
+        .recent-item {
+            padding: 8px 10px;
+            border-bottom: 1px solid #21262d;
+            color: #e6edf3;
+            font-size: 0.88em;
+        }
+        .recent-item:last-child {
+            border-bottom: none;
+        }
+        .badge-scam { color: #ffb703; font-weight: bold; }
+        .badge-ok { color: #00ff88; font-weight: bold; }
     </style>
     <script>
         function updateData() {
@@ -835,8 +1008,9 @@ HTML_TEMPLATE = """
                 .then(data => {
                     document.getElementById('time').innerText = data.time;
                     document.getElementById('checked').innerText = data.checked;
-                    document.getElementById('found').innerText = data.found + ' / ' + data.limit;
+                    document.getElementById('found').innerText = data.found + ' / ' + data.limit_label;
                     document.getElementById('db_total').innerText = data.db_total;
+                    document.getElementById('filter_mode').innerText = data.filter_label;
                     document.getElementById('query').innerText = data.query;
                     document.getElementById('status').innerText = data.status;
 
@@ -847,6 +1021,21 @@ HTML_TEMPLATE = """
                         div.textContent = '> ' + line;
                         logDiv.appendChild(div);
                     });
+
+                    const recentDiv = document.getElementById('recent');
+                    recentDiv.innerHTML = '';
+                    const recentList = data.recent_live || [];
+                    if (recentList.length === 0) {
+                        recentDiv.innerHTML = '<div class="recent-item">Пока нет сохранённых находок</div>';
+                    } else {
+                        recentList.forEach(item => {
+                            const row = document.createElement('div');
+                            row.className = 'recent-item';
+                            const tag = item.scam ? '[СКАМ/WH]' : '[НОРМ]';
+                            row.textContent = `${tag} [${item.type}] @${item.bot} — ${item.token}`;
+                            recentDiv.appendChild(row);
+                        });
+                    }
                 })
                 .catch(() => {});
         }
@@ -856,7 +1045,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>[ HUNTER DASHBOARD ]</h1>
+        <h1>[ HUNTER DASHBOARD PRO ]</h1>
         <div class="card">
             <div class="grid">
                 <div class="stat-box">
@@ -875,10 +1064,19 @@ HTML_TEMPLATE = """
                     <div class="label">Всего в базе</div>
                     <div class="value" id="db_total">0</div>
                 </div>
+                <div class="stat-box">
+                    <div class="label">Фильтр сессии</div>
+                    <div class="value" id="filter_mode">Все живые</div>
+                </div>
             </div>
             <p><strong>Запрос:</strong> <span id="query">...</span></p>
             <p><strong>Статус:</strong> <span id="status">...</span></p>
             <div class="log" id="logs"></div>
+        </div>
+
+        <div class="card">
+            <h3 style="margin-top:0;">Последние находки в базе</h3>
+            <div id="recent"></div>
         </div>
     </div>
 </body>
@@ -899,28 +1097,48 @@ def health():
 @app.route("/api/stats")
 def api_stats():
     snap = get_state_snapshot()
+    live_all = load_live_tokens()
+    limit_val = snap["limit_live"]
+    limit_label = "∞" if limit_val >= 999 else str(limit_val)
+    filter_label = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+
     return jsonify({
         "time": snap["time"],
         "checked": snap["checked_tokens"],
         "found": snap["found_live_current"],
-        "limit": snap["limit_live"],
-        "db_total": len(load_live_tokens()),
+        "limit": limit_val,
+        "limit_label": limit_label,
+        "filter_mode": snap["filter_mode"],
+        "filter_label": filter_label,
+        "db_total": len(live_all),
         "query": snap["current_query"],
         "status": snap["status_text"],
         "logs": snap["logs"],
+        "recent_live": list(reversed(live_all[-10:])),
     })
 
 
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    with state_lock:
+        search_state["stop_requested"] = True
+        search_state["status_text"] = "Остановлено через API"
+    add_log("🛑 Получена команда остановки через веб-API")
+    return jsonify({"ok": True, "status": "stopping"}), 200
+
+
 # =====================================================================
-# ТЕЛЕГРАМ-БОТ: ИНТЕРФЕЙС И КОМАНДЫ
+# ТЕЛЕГРАМ-БОТ: ИНТЕРФЕЙС, РУЧНАЯ ПРОВЕРКА, ФИЛЬТРЫ И ЭКСПОРТ
 # =====================================================================
 def get_main_menu() -> types.ReplyKeyboardMarkup:
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
         "🚀 Начать поиск",
         "🛑 Остановить",
+        "🧪 Проверка токена",
+        "🎛 Фильтр сессии",
         "⚙️ Настройки",
-        "🗂 База и Фильтры",
+        "🗂 База и Экспорт",
     )
     return markup
 
@@ -930,23 +1148,61 @@ def get_progress_buttons() -> types.InlineKeyboardMarkup:
     markup.add(
         types.InlineKeyboardButton("📊 График", callback_data="show_chart"),
         types.InlineKeyboardButton("🏆 Топ-5", callback_data="show_top5"),
+        types.InlineKeyboardButton("🎛 Фильтр", callback_data="quick_filter"),
         types.InlineKeyboardButton("🔄 Обновить", callback_data="force_update"),
         types.InlineKeyboardButton("🛑 Стоп", callback_data="stop_search_btn"),
     )
     return markup
 
 
+def get_filter_keyboard() -> types.InlineKeyboardMarkup:
+    snap = get_state_snapshot()
+    cur = snap["filter_mode"]
+
+    def mark(mode_key: str, title: str) -> str:
+        return f"✅ {title}" if cur == mode_key else title
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(mark("all", "Все живые (в чат + в таблицу)"), callback_data="setfilter_all"),
+        types.InlineKeyboardButton(mark("no_scam", "Только не-скам (без скам-ботов и webhook)"), callback_data="setfilter_no_scam"),
+        types.InlineKeyboardButton(mark("tg_only", "Только Telegram-боты"), callback_data="setfilter_tg_only"),
+    )
+    return markup
+
+
+def _build_filter_menu_text() -> str:
+    snap = get_state_snapshot()
+    cur_label = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+    return (
+        f"🎛 <b>Фильтр находок во время поиска</b>\n\n"
+        f"Текущий режим: <code>{html.escape(cur_label)}</code>\n"
+        f"Пропущено фильтром за сессию: <code>{snap['skipped_by_filter']}</code>\n\n"
+        f"<i>Режим можно менять прямо во время активного поиска — он применится на лету к новым находкам (в чат и в Google Таблицу).</i>"
+    )
+
+
 @bot.message_handler(commands=["start"])
 def send_welcome(message: types.Message):
-    if not is_admin(message.chat.id, message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
         return
 
-    sheets_status = "подключён" if (SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW)) else "не настроен"
+    sheets_ok = bool(SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW))
+    sheets_status = "подключён" if sheets_ok else "не настроен"
+    snap = get_state_snapshot()
+    cur_filter = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+
     welcome_text = (
         "👋 <b>Пульт Hunter PRO</b>\n"
-        "Многопоточная проверка, безопасный HTML, GitHub/GitLab поиск и Google Sheets.\n\n"
+        "Многопоточный сканер токенов и вебхуков с ручной проверкой, фильтрами, графиками и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
-        f"🗂 Записей в базе: <code>{len(load_live_tokens())}</code>"
+        f"🎛 Фильтр сессии: <code>{html.escape(cur_filter)}</code>\n"
+        f"🗂 Записей в базе: <code>{len(load_live_tokens())}</code>\n\n"
+        "<b>Команды:</b>\n"
+        "/check &lt;токен или webhook&gt; — ручная проверка\n"
+        "/filter — переключить фильтр сессии\n"
+        "/status — быстрый статус"
     )
     bot.send_message(
         message.chat.id,
@@ -956,14 +1212,223 @@ def send_welcome(message: types.Message):
     )
 
 
+@bot.message_handler(commands=["status"])
+def cmd_status(message: types.Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
+        return
+
+    snap = get_state_snapshot()
+    cur_filter = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
+    limit_str = "∞" if snap["limit_live"] >= 999 else str(snap["limit_live"])
+    running_str = "Активен" if snap["is_searching"] else "Остановлен"
+
+    text = (
+        f"📡 <b>Статус Hunter PRO</b>\n\n"
+        f"• Состояние: <code>{html.escape(running_str)}</code>\n"
+        f"• Статус задачи: <code>{html.escape(snap['status_text'])}</code>\n"
+        f"• Время: <code>{html.escape(snap['time'])}</code>\n"
+        f"• Проверено: <code>{snap['checked_tokens']}</code>\n"
+        f"• Живых за сессию: <code>{snap['found_live_current']} / {limit_str}</code>\n"
+        f"• Пропущено фильтром: <code>{snap['skipped_by_filter']}</code>\n"
+        f"• Фильтр: <code>{html.escape(cur_filter)}</code>\n"
+        f"• Записей в базе: <code>{len(load_live_tokens())}</code>"
+    )
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["filter"])
+@bot.message_handler(func=lambda m: m.text == "🎛 Фильтр сессии")
+def show_filter_menu(message: types.Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
+        return
+
+    bot.send_message(
+        message.chat.id,
+        _build_filter_menu_text(),
+        reply_markup=get_filter_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "quick_filter")
+def cb_quick_filter(call: types.CallbackQuery):
+    chat_id = call.message.chat.id if call.message else None
+    user_id = call.from_user.id if call.from_user else None
+    if not is_admin(chat_id, user_id):
+        bot.answer_callback_query(call.id, "Доступ запрещён", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    if chat_id:
+        bot.send_message(
+            chat_id,
+            _build_filter_menu_text(),
+            reply_markup=get_filter_keyboard(),
+            parse_mode="HTML",
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setfilter_"))
+def cb_set_filter(call: types.CallbackQuery):
+    chat_id = call.message.chat.id if call.message else None
+    user_id = call.from_user.id if call.from_user else None
+    if not is_admin(chat_id, user_id):
+        bot.answer_callback_query(call.id, "Доступ запрещён", show_alert=True)
+        return
+
+    mode_key = call.data.split("_", 1)[1]
+    if mode_key not in FILTER_MODES:
+        bot.answer_callback_query(call.id, "Неизвестный фильтр")
+        return
+
+    with state_lock:
+        search_state["filter_mode"] = mode_key
+
+    label = FILTER_MODES[mode_key]
+    add_log(f"🎛 Переключён фильтр сессии: {label}")
+    bot.answer_callback_query(call.id, f"Фильтр: {label}")
+
+    if call.message:
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=_build_filter_menu_text(),
+                reply_markup=get_filter_keyboard(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+# --- РУЧНАЯ ПРОВЕРКА ТОКЕНА / ВЕБХУКА ---
+@bot.message_handler(commands=["check"])
+def cmd_check(message: types.Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
+        return
+
+    raw_text = message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        _run_manual_check_and_reply(message.chat.id, parts[1].strip())
+        return
+
+    if user_id is not None:
+        with state_lock:
+            awaiting_manual_check[user_id] = time.time() + 120
+
+    bot.send_message(
+        message.chat.id,
+        "🧪 <b>Ручная проверка</b>\n\n"
+        "Отправь следующим сообщением Telegram-токен, Discord Bot Token или ссылку на Discord Webhook (в течение 2 минут).",
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "🧪 Проверка токена")
+def btn_manual_check(message: types.Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
+        return
+
+    if user_id is not None:
+        with state_lock:
+            awaiting_manual_check[user_id] = time.time() + 120
+
+    bot.send_message(
+        message.chat.id,
+        "🧪 <b>Ручная проверка токена или webhook</b>\n\n"
+        "Скинь сюда ключ или ссылку <code>https://discord.com/api/webhooks/...</code> — проверю статус, скам-признаки и соберу досье.",
+        parse_mode="HTML",
+    )
+
+
+def _run_manual_check_and_reply(chat_id: int, target_str: str) -> None:
+    wait_msg = bot.send_message(chat_id, "⏳ <i>Проверяю цель и собираю досье...</i>", parse_mode="HTML")
+
+    def _worker():
+        report_html, token_info = manual_check_target(target_str)
+        if token_info is not None:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton("💾 Сохранить в базу и Sheets", callback_data="save_manual_last")
+            )
+            with state_lock:
+                search_state["_last_manual_token"] = token_info
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=wait_msg.message_id,
+                    text=report_html,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                bot.send_message(
+                    chat_id,
+                    report_html,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+        else:
+            try:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=wait_msg.message_id,
+                    text=report_html,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                bot.send_message(
+                    chat_id,
+                    report_html,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "save_manual_last")
+def cb_save_manual_last(call: types.CallbackQuery):
+    chat_id = call.message.chat.id if call.message else None
+    user_id = call.from_user.id if call.from_user else None
+    if not is_admin(chat_id, user_id):
+        bot.answer_callback_query(call.id, "Доступ запрещён", show_alert=True)
+        return
+
+    with state_lock:
+        last_item = search_state.get("_last_manual_token")
+
+    if not last_item:
+        bot.answer_callback_query(call.id, "Данные проверки устарели.")
+        return
+
+    added = save_live_token(last_item)
+    if added:
+        add_log(f"💾 Ручная находка сохранена в базу: {last_item.get('bot')}")
+        bot.answer_callback_query(call.id, "Сохранено в базу и отправлено в Sheets!")
+    else:
+        bot.answer_callback_query(call.id, "Этот ключ уже есть в базе.")
+
+
+# --- НАСТРОЙКИ И ОСТАНОВКА ---
 @bot.message_handler(func=lambda m: m.text == "⚙️ Настройки")
 def show_settings(message: types.Message):
-    if not is_admin(message.chat.id, message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
         return
 
     snap = get_state_snapshot()
     current_limit = snap["limit_live"]
     limit_label = "Без лимита" if current_limit >= 999 else str(current_limit)
+    cur_filter = FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"])
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -974,7 +1439,9 @@ def show_settings(message: types.Message):
     )
     bot.send_message(
         message.chat.id,
-        f"⚙️ <b>Текущий лимит живых находок:</b> <code>{html.escape(limit_label)}</code>",
+        f"⚙️ <b>Настройки поиска</b>\n\n"
+        f"• Лимит живых находок: <code>{html.escape(limit_label)}</code>\n"
+        f"• Фильтр сессии: <code>{html.escape(cur_filter)}</code>",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -1013,7 +1480,8 @@ def callback_settings(call: types.CallbackQuery):
 
 @bot.message_handler(func=lambda m: m.text == "🛑 Остановить")
 def stop_command(message: types.Message):
-    if not is_admin(message.chat.id, message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
         return
 
     with state_lock:
@@ -1022,9 +1490,11 @@ def stop_command(message: types.Message):
     bot.send_message(message.chat.id, "⏹️ Команда остановки принята.")
 
 
-@bot.message_handler(func=lambda m: m.text == "🗂 База и Фильтры")
+# --- БАЗА, ФИЛЬТРЫ И ЭКСПОРТ (.TXT / .CSV / .JSON) ---
+@bot.message_handler(func=lambda m: m.text == "🗂 База и Экспорт")
 def show_db_menu(message: types.Message):
-    if not is_admin(message.chat.id, message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
         return
 
     live_tokens = load_live_tokens()
@@ -1035,15 +1505,17 @@ def show_db_menu(message: types.Message):
         types.InlineKeyboardButton("Все", callback_data="db_all"),
         types.InlineKeyboardButton("Telegram", callback_data="db_tg"),
         types.InlineKeyboardButton("Discord", callback_data="db_dc"),
-        types.InlineKeyboardButton("Только Скам / WH", callback_data="db_scam"),
-        types.InlineKeyboardButton("📥 Экспорт в файл", callback_data="export_file"),
+        types.InlineKeyboardButton("Скам / WH", callback_data="db_scam"),
+        types.InlineKeyboardButton("📄 Экспорт .TXT", callback_data="export_txt"),
+        types.InlineKeyboardButton("📊 Экспорт .CSV", callback_data="export_csv"),
+        types.InlineKeyboardButton("🧾 Экспорт .JSON", callback_data="export_json"),
         types.InlineKeyboardButton("🧹 Сброс seen-кэша", callback_data="clear_seen"),
     )
     bot.send_message(
         message.chat.id,
         f"🗂 <b>База находок:</b> <code>{len(live_tokens)}</code> | "
         f"<b>В кэше проверенных:</b> <code>{seen_count}</code>\n"
-        "Выбери фильтр или действие:",
+        "Выбери фильтр или формат выгрузки:",
         reply_markup=markup,
         parse_mode="HTML",
     )
@@ -1099,8 +1571,10 @@ def cb_show_db(call: types.CallbackQuery):
         )
 
 
-@bot.callback_query_handler(func=lambda call: call.data == "export_file")
-def export_live_db(call: types.CallbackQuery):
+@bot.callback_query_handler(
+    func=lambda call: call.data in ("export_txt", "export_csv", "export_json")
+)
+def cb_export_db(call: types.CallbackQuery):
     chat_id = call.message.chat.id if call.message else None
     user_id = call.from_user.id if call.from_user else None
     if not is_admin(chat_id, user_id):
@@ -1112,23 +1586,46 @@ def export_live_db(call: types.CallbackQuery):
         bot.answer_callback_query(call.id, "База пуста, нечего экспортировать.")
         return
 
-    bot.answer_callback_query(call.id, "Формирую файл...")
-    buf = io.BytesIO()
-    for item in live_tokens:
-        line = (
-            f"[{item.get('type', 'TG')}] "
-            f"@{item.get('bot', 'unknown')} | "
-            f"{item.get('token', '')} | "
-            f"{item.get('url', '')} | "
-            f"scam={item.get('scam', False)}\n"
-        )
-        buf.write(line.encode("utf-8"))
-    buf.seek(0)
-    filename = f"live_tokens_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    buf.name = filename
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fmt = call.data.split("_", 1)[1]
 
+    if fmt == "txt":
+        text_buf = io.StringIO()
+        for item in live_tokens:
+            text_buf.write(
+                f"[{item.get('type', 'TG')}] "
+                f"@{item.get('bot', 'unknown')} | "
+                f"{item.get('token', '')} | "
+                f"{item.get('url', '')} | "
+                f"scam={item.get('scam', False)}\n"
+            )
+        raw_bytes = text_buf.getvalue().encode("utf-8")
+        filename = f"live_tokens_{stamp}.txt"
+    elif fmt == "csv":
+        csv_buf = io.StringIO()
+        writer = csv.writer(csv_buf)
+        writer.writerow(["found_at", "type", "bot", "token", "repo", "url", "scam"])
+        for item in live_tokens:
+            writer.writerow([
+                item.get("found_at", ""),
+                item.get("type", ""),
+                item.get("bot", ""),
+                item.get("token", ""),
+                item.get("repo", ""),
+                item.get("url", ""),
+                bool(item.get("scam", False)),
+            ])
+        raw_bytes = csv_buf.getvalue().encode("utf-8-sig")
+        filename = f"live_tokens_{stamp}.csv"
+    else:
+        raw_bytes = json.dumps(live_tokens, ensure_ascii=False, indent=2).encode("utf-8")
+        filename = f"live_tokens_{stamp}.json"
+
+    bot.answer_callback_query(call.id, f"Выгружаю {fmt.upper()}...")
+    out_stream = io.BytesIO(raw_bytes)
+    out_stream.seek(0)
     if chat_id:
-        bot.send_document(chat_id, buf, visible_file_name=filename)
+        bot.send_document(chat_id, out_stream, visible_file_name=filename)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "clear_seen")
@@ -1184,7 +1681,7 @@ def cb_show_top5(call: types.CallbackQuery):
     lines = ["🏆 <b>Топ-5 источников по находкам:</b>\n"]
     for idx, (owner, count) in enumerate(top, 1):
         safe_owner = html.escape(owner)
-        if owner.startswith("gitlab/"):
+        if owner.startswith("gitlab/") or owner == "manual":
             lines.append(f"{idx}. <code>{safe_owner}</code> — <b>{count}</b>")
         else:
             lines.append(
@@ -1227,12 +1724,42 @@ def cb_force_update(call: types.CallbackQuery):
         update_progress_message(call.message.chat.id, call.message.message_id)
 
 
+# Перехват текстового сообщения, если админ нажал «Проверка токена» и ждёт ввод ключа
+@bot.message_handler(
+    func=lambda m: bool(m.text) and not m.text.startswith("/") and m.text not in {
+        "🚀 Начать поиск",
+        "🛑 Остановить",
+        "🧪 Проверка токена",
+        "🎛 Фильтр сессии",
+        "⚙️ Настройки",
+        "🗂 База и Экспорт",
+    }
+)
+def handle_manual_target_text(message: types.Message):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id) or user_id is None:
+        return
+
+    now_ts = time.time()
+    should_check = False
+    with state_lock:
+        exp = awaiting_manual_check.get(user_id)
+        if exp is not None:
+            del awaiting_manual_check[user_id]
+            if now_ts <= exp:
+                should_check = True
+
+    if should_check and message.text:
+        _run_manual_check_and_reply(message.chat.id, message.text)
+
+
 # =====================================================================
-# ЗАПУСК ПОИСКА И ПАРАЛЛЕЛЬНАЯ ОБРАБОТКА НАХОДОК
+# ЗАПУСК ПОИСКА, ФИЛЬТРАЦИЯ НА ЛЕТУ И СВОДНЫЙ ОТЧЁТ
 # =====================================================================
 @bot.message_handler(func=lambda m: m.text == "🚀 Начать поиск")
 def start_search_command(message: types.Message):
-    if not is_admin(message.chat.id, message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+    if not is_admin(message.chat.id, user_id):
         return
 
     with state_lock:
@@ -1244,9 +1771,13 @@ def start_search_command(message: types.Message):
             "is_searching": True,
             "stop_requested": False,
             "found_live_current": 0,
+            "skipped_by_filter": 0,
             "checked_tokens": 0,
             "dead_tokens": 0,
             "scam_tokens": 0,
+            "tg_found": 0,
+            "dc_found": 0,
+            "wh_found": 0,
             "start_time": time.time(),
             "current_query": "Подготовка запроса...",
             "status_text": "Запуск...",
@@ -1254,7 +1785,6 @@ def start_search_command(message: types.Message):
             "phrase": "Инициализация сканера...",
         })
 
-    # Пробуем заранее прогреть подключение к Google Sheets, чтобы сразу увидеть статус
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
         threading.Thread(target=get_google_worksheet, daemon=True).start()
 
@@ -1287,7 +1817,7 @@ def live_ui_updater(chat_id: int, msg_id: int) -> None:
 
         update_progress_message(chat_id, msg_id, spinner_idx)
         spinner_idx += 1
-        _sleep_respecting_stop(3)
+        _sleep_respecting_stop(5)
 
 
 def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> None:
@@ -1299,6 +1829,7 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
     safe_query = html.escape(str(snap["current_query"]))
     safe_phrase = html.escape(str(snap["phrase"]))
     safe_status = html.escape(str(snap["status_text"]))
+    safe_filter = html.escape(FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"]))
 
     limit_str = "∞" if snap["limit_live"] >= 999 else str(snap["limit_live"])
 
@@ -1308,6 +1839,7 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
         f"🔍 Проверено: <code>{snap['checked_tokens']}</code>\n"
         f"🟢 Живых: <code>{snap['found_live_current']} / {limit_str}</code> | "
         f"⚠️ Скам: <code>{snap['scam_tokens']}</code>\n"
+        f"🎛 Фильтр: <code>{safe_filter}</code> (пропущено: <code>{snap['skipped_by_filter']}</code>)\n"
         f"📌 Статус: <code>{safe_status}</code>\n\n"
         f"📡 Запрос: <code>{safe_query}</code>\n\n"
         f"📟 <b>Консоль событий ({MAX_LOG_LINES} строк):</b>\n"
@@ -1325,6 +1857,14 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
         )
     except Exception:
         pass
+
+
+def _matches_session_filter(f_type: str, is_scam: bool, filter_mode: str) -> bool:
+    if filter_mode == "no_scam":
+        return (not is_scam) and (f_type != "Webhook")
+    if filter_mode == "tg_only":
+        return f_type == "Telegram"
+    return True
 
 
 def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
@@ -1360,11 +1900,23 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         if search_state["found_live_current"] >= search_state["limit_live"]:
             return
 
+        cur_filter = search_state["filter_mode"]
+        if not _matches_session_filter(f_type, is_scam, cur_filter):
+            search_state["skipped_by_filter"] += 1
+            add_log(f"⏭️ Пропущено фильтром [{cur_filter}]: {f_type} ({bot_name})")
+            return
+
         search_state["found_live_current"] += 1
         current_found = search_state["found_live_current"]
         current_limit = search_state["limit_live"]
         if is_scam:
             search_state["scam_tokens"] += 1
+        if f_type == "Telegram":
+            search_state["tg_found"] += 1
+        elif f_type == "Discord":
+            search_state["dc_found"] += 1
+        elif f_type == "Webhook":
+            search_state["wh_found"] += 1
 
     token_info = {
         "type": f_type,
@@ -1385,7 +1937,6 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     scam_badge = "⚠️ СКАМ / ПОДОЗРИТЕЛЬНО" if is_scam else "✅ НОРМ"
     limit_str = "∞" if current_limit >= 999 else str(current_limit)
 
-    # dossier уже содержит безопасный HTML с экранированными полями
     card_text = (
         f"🚨 <b>НАЙДЕН {safe_type}!</b> ({current_found}/{limit_str})\n\n"
         f"🤖 Имя / Цель: <b>{safe_bot}</b>\n"
@@ -1405,6 +1956,29 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         )
     except Exception as exc:
         add_log(f"⚠️ Не удалось отправить карточку в TG: {exc}")
+
+
+def _build_final_summary(snap: Dict[str, Any]) -> str:
+    status_final = html.escape(str(snap["status_text"]))
+    filter_final = html.escape(FILTER_MODES.get(snap["filter_mode"], snap["filter_mode"]))
+    elapsed_str = html.escape(snap["time"])
+    total_db = len(load_live_tokens())
+
+    return (
+        f"🏁 <b>Поиск завершён — Сводный отчёт</b>\n\n"
+        f"📌 Причина: <code>{status_final}</code>\n"
+        f"⏱ Длительность: <code>{elapsed_str}</code>\n"
+        f"🎛 Фильтр сессии: <code>{filter_final}</code>\n\n"
+        f"🔍 Всего проверено: <code>{snap['checked_tokens']}</code>\n"
+        f"🟢 Принято живых: <code>{snap['found_live_current']}</code>\n"
+        f"   ├ Telegram: <code>{snap['tg_found']}</code>\n"
+        f"   ├ Discord: <code>{snap['dc_found']}</code>\n"
+        f"   └ Webhooks: <code>{snap['wh_found']}</code>\n"
+        f"⚠️ Подозрительных / Скам: <code>{snap['scam_tokens']}</code>\n"
+        f"❌ Мёртвых: <code>{snap['dead_tokens']}</code>\n"
+        f"⏭️ Пропущено фильтром: <code>{snap['skipped_by_filter']}</code>\n\n"
+        f"🗂 Всего записей в базе: <code>{total_db}</code>"
+    )
 
 
 def run_search_task(chat_id: int, msg_id: int) -> None:
@@ -1435,16 +2009,17 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
             if not raw_findings:
                 continue
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            try:
                 futures = [
                     executor.submit(process_single_finding, item, chat_id)
                     for item in raw_findings
                 ]
-                for fut in concurrent.futures.as_completed(futures):
+                for fut in concurrent.futures.as_completed(futures, timeout=30):
                     try:
-                        fut.result()
+                        fut.result(timeout=5)
                     except Exception as exc:
-                        add_log(f"⚠️ Ошибка в воркере проверки: {exc}")
+                        add_log(f"⚠️ Ошибка воркера: {exc}")
 
                     with state_lock:
                         if (
@@ -1452,40 +2027,37 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                             or search_state["found_live_current"] >= search_state["limit_live"]
                         ):
                             break
+            except concurrent.futures.TimeoutError:
+                add_log("⏳ Таймаут пачки проверок — перехожу к следующему запросу")
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
     finally:
         with state_lock:
             search_state["is_searching"] = False
-            elapsed = (
-                time.time() - search_state["start_time"]
-                if search_state["start_time"]
-                else 0
-            )
-            found_final = search_state["found_live_current"]
-            checked_final = search_state["checked_tokens"]
-            status_final = html.escape(search_state["status_text"])
+            if search_state["start_time"] is None:
+                search_state["start_time"] = time.time()
 
-        final_text = (
-            f"🏁 <b>Поиск завершён.</b>\n"
-            f"📌 Причина: <code>{status_final}</code>\n"
-            f"⏱ Время: <code>{format_time(elapsed)}</code>\n"
-            f"🔍 Проверено: <code>{checked_final}</code>\n"
-            f"🟢 Найдено живых: <code>{found_final}</code>"
-        )
+        snap = get_state_snapshot()
+        summary_text = _build_final_summary(snap)
+
         try:
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text=final_text,
+                text=summary_text,
                 parse_mode="HTML",
                 reply_markup=None,
             )
         except Exception:
-            pass
+            try:
+                bot.send_message(chat_id, summary_text, parse_mode="HTML")
+            except Exception:
+                pass
 
 
 # =====================================================================
-# ЗАПУСК ПОЛЛИНГА БОТА (УСТОЙЧИВОСТЬ К 409 CONFLICT) AND FLASK
+# ЗАПУСК ПОЛЛИНГА БОТА (УСТОЙЧИВОСТЬ К 409 CONFLICT) И FLASK
 # =====================================================================
 def run_bot_polling() -> None:
     try:
@@ -1523,13 +2095,10 @@ def run_bot_polling() -> None:
 
 
 if __name__ == "__main__":
-    # Проверяем Google Sheets при старте (если настроены переменные)
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
         threading.Thread(target=get_google_worksheet, daemon=True).start()
 
-    # Запускаем Telegram-бота в фоновом потоке
     threading.Thread(target=run_bot_polling, daemon=True).start()
 
-    # Запускаем веб-сервер Flask для Render / healthcheck
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
