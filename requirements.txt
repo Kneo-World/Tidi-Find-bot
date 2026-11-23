@@ -3,3 +3,5 @@ pyTelegramBotAPI
 rich
 matplotlib
 flask
+gspread
+google-auth
