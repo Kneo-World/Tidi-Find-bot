@@ -12,6 +12,7 @@ import signal
 import urllib.parse
 import threading
 import traceback
+import faulthandler
 from typing import List, Dict, Optional, Tuple, Any, Set
 from datetime import datetime
 from collections import Counter
@@ -63,7 +64,7 @@ app = Flask(__name__)
 
 search_session = requests.Session()
 search_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/8.6 (+https://github.com)",
+    "User-Agent": "HunterPRO-Scanner/8.7 (+https://github.com)",
     "Accept": "application/json",
 })
 
@@ -582,7 +583,7 @@ def _direct_get_json(
     timeout: Tuple[float, float] = TARGET_TIMEOUT,
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     req_headers = {
-        "User-Agent": "HunterPRO-Verifier/8.6",
+        "User-Agent": "HunterPRO-Verifier/8.7",
         "Accept": "application/json",
         "Connection": "close",
     }
@@ -1510,7 +1511,7 @@ def send_welcome(message: types.Message):
     cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
-        "👋 <b>Пульт Hunter PRO v8.6</b>\n"
+        "👋 <b>Пульт Hunter PRO v8.7</b>\n"
         "Сканер токенов и вебхуков с супер-отладкой, ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
         f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
@@ -2221,6 +2222,7 @@ def live_ui_updater(chat_id: int, msg_id: int) -> None:
 
 
 def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> None:
+    trace("update_progress_message старт")
     snap = get_state_snapshot()
     spinner = SPINNERS[spinner_idx % len(SPINNERS)]
 
@@ -2256,6 +2258,7 @@ def update_progress_message(chat_id: int, msg_id: int, spinner_idx: int = 0) -> 
             parse_mode="HTML",
             reply_markup=get_progress_buttons(),
         )
+        trace("update_progress_message успех")
     except Exception as e:
         trace(f"edit_message_text skip: {str(e)[:40]}")
 
@@ -2280,6 +2283,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     repo = finding.get("repo", "unknown")
     url = finding.get("url", "")
 
+    trace("Вызываю add_log перед проверкой")
     add_log(f"🔎 Проверяю {f_type} из {repo}...")
 
     is_live = False
@@ -2289,19 +2293,23 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     err_reason: Optional[str] = None
 
     try:
+        trace("Вызываю check_finding_direct")
         is_live, bot_name, is_scam, dossier, err_reason = check_finding_direct(f_type, token)
     except Exception as exc:
         traceback.print_exc()
         err_reason = f"сбой:{str(exc)[:18]}"
 
     trace(f"Итог проверки {f_type}: live={is_live}, name={bot_name}, err={err_reason}")
+    trace("Вход в state_lock для обновления счётчиков")
 
     with state_lock:
+        trace("Внутри state_lock")
         search_state["checked_tokens"] += 1
         checked_now = search_state["checked_tokens"]
         if not is_live:
             search_state["dead_tokens"] += 1
             suffix = f" ({err_reason})" if err_reason else ""
+            trace("Вызываю add_log для мёртвого токена")
             add_log(f"❌ #{checked_now} Мёртвый {f_type} [{repo[:24]}]{suffix}")
             trace("process_single_finding конец (мёртвый)")
             return
@@ -2337,6 +2345,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
         "bot": bot_name or "Unknown",
         "scam": is_scam,
     }
+    trace("Сохраняю живой токен")
     save_live_token(token_info)
     add_log(f"🟢 #{checked_now} БИНГО! {f_type}: {bot_name}")
 
@@ -2359,6 +2368,7 @@ def process_single_finding(finding: Dict[str, str], chat_id: int) -> None:
     )
 
     try:
+        trace("Отправляю карточку в TG")
         bot.send_message(
             chat_id,
             card_text,
@@ -2404,6 +2414,7 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
             cycle_num += 1
             trace(f"=== Начало цикла #{cycle_num} ===")
             try:
+                trace("Проверка условий продолжения цикла")
                 with state_lock:
                     if search_state["stop_requested"]:
                         search_state["status_text"] = "Остановлено пользователем"
@@ -2448,7 +2459,9 @@ def run_search_task(chat_id: int, msg_id: int) -> None:
                     set_status(f"Проверка {idx}/{total_cands}...")
                     trace(f"Цикл #{cycle_num}: кандидат {idx}/{total_cands} ({item.get('type')})")
                     process_single_finding(item, chat_id)
+                    trace(f"Цикл #{cycle_num}: после process_single_finding {idx}/{total_cands}")
                     update_progress_message(chat_id, msg_id)
+                    trace(f"Цикл #{cycle_num}: после update_progress_message {idx}/{total_cands}")
 
                 trace(f"=== Конец цикла #{cycle_num} ===")
 
@@ -2526,7 +2539,11 @@ def run_bot_polling() -> None:
 
 
 if __name__ == "__main__":
-    trace(f"Старт приложения Hunter PRO v8.6 (PID={os.getpid()})")
+    try:
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
+    trace(f"Старт приложения Hunter PRO v8.7 (PID={os.getpid()})")
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
         threading.Thread(target=get_google_worksheet, name="SheetsStartup", daemon=True).start()
 
