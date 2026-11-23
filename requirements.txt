@@ -1,0 +1,5 @@
+requests
+pyTelegramBotAPI
+rich
+matplotlib
+flask
